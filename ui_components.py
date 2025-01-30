@@ -5,9 +5,9 @@ from PyQt6.QtWidgets import (
     QCheckBox, QSlider, QMenuBar, QMenu, QStatusBar, QMainWindow,
     QMessageBox, QDialog, QFileDialog, QDialogButtonBox, QScrollArea, 
     QFrame, QSizePolicy, QLineEdit, QGridLayout, QListWidget, QListWidgetItem,
-    QPlainTextEdit, QInputDialog  # Add QInputDialog here
+    QPlainTextEdit, QInputDialog, QTabWidget  # Add QTabWidget here
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
 from typing import Dict, Any, List, Tuple, Optional  # Add these imports
 import sounddevice as sd
 from config import AudioConfig
@@ -15,6 +15,11 @@ from audio_sources import MonitoredInputSource
 from PyQt6.QtGui import QDoubleValidator
 import numpy as np
 import os  # Add this import
+import threading
+import logging
+from PyQt6.QtCore import QSettings
+
+logger = logging.getLogger(__name__)
 
 # At module level, before classes
 def update_device_list(combo: QComboBox, input_devices: bool = False):
@@ -125,9 +130,9 @@ class ParameterControl(QWidget):
 class BufferSettingsDialog(QDialog):
     def __init__(self, config: AudioConfig, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)  # Just use Window type
         self.config = config
         self.setWindowTitle("Audio Buffer Settings")
-        self.setModal(True)
         self.init_ui()
 
     def init_ui(self):
@@ -187,16 +192,21 @@ class MonitoringPanel(QGroupBox):
 
     def init_ui(self):
         layout = QFormLayout(self)
-
-        # Device selector
-        self.device_combo = QComboBox()
-        self.update_device_list()
-        layout.addRow("Output Device:", self.device_combo)
+        layout.setSpacing(4)  # Increased from 1
+        layout.setContentsMargins(6, 8, 6, 8)  # Increased from 1,1,1,1
+        layout.setVerticalSpacing(6)  # Add vertical spacing between rows
+        layout.setHorizontalSpacing(8)  # Add horizontal spacing between label and field
 
         # Monitoring checkbox
         self.monitor_checkbox = QCheckBox("Enable Monitoring")
-        self.monitor_checkbox.toggled.connect(self.on_monitor_toggled)
+        self.monitor_checkbox.setChecked(self.config.monitoring_enabled)
+        self.monitor_checkbox.stateChanged.connect(self.on_monitor_toggled)
         layout.addRow(self.monitor_checkbox)
+
+        # Device selector - use DeviceComboBox instead of QComboBox
+        self.device_combo = DeviceComboBox(input_devices=False)
+        self.device_combo.currentIndexChanged.connect(lambda: self.monitoring_changed.emit(self.monitor_checkbox.isChecked()))
+        layout.addRow("Output Device:", self.device_combo)
 
         # Volume slider with marks
         volume_layout = QHBoxLayout()
@@ -305,21 +315,21 @@ class MonitoringPanel(QGroupBox):
         self.config.monitoring_volume = volume
 
     def get_current_settings(self) -> Dict[str, Any]:
+        """Get current panel settings"""
         return {
             'monitoring_enabled': self.monitor_checkbox.isChecked(),
             'monitoring_volume': self.volume_slider.value(),
-            'output_device_index': self.device_combo.currentData()
+            'output_device': self.device_combo.get_device_info()
         }
 
     def apply_settings(self, settings: Dict[str, Any]):
+        """Apply loaded settings"""
         if 'monitoring_enabled' in settings:
             self.monitor_checkbox.setChecked(settings['monitoring_enabled'])
         if 'monitoring_volume' in settings:
             self.volume_slider.setValue(settings['monitoring_volume'])
-        if 'output_device_index' in settings:
-            index = self.device_combo.findData(settings['output_device_index'])
-            if (index >= 0):
-                self.device_combo.setCurrentIndex(index)
+        if 'output_device' in settings:
+            self.device_combo.set_device_from_info(settings['output_device'])
 
 class InputDevicePanel(QGroupBox):
     device_changed = pyqtSignal(int)
@@ -332,15 +342,14 @@ class InputDevicePanel(QGroupBox):
     def init_ui(self):
         layout = QFormLayout(self)
 
-        # Device selector
-        self.device_combo = QComboBox()
-        self.update_device_list()
+        # Device selector - use DeviceComboBox instead of QComboBox
+        self.device_combo = DeviceComboBox(input_devices=True)
         self.device_combo.currentIndexChanged.connect(self.on_device_changed)
         layout.addRow("Input Device:", self.device_combo)
 
         # Input channel selector
         self.channel_combo = QComboBox()
-        self.channel_combo.setVisible(False)
+        self.channel_combo.setVisible(False)  # Initially hidden
         layout.addRow("Input Channel:", self.channel_combo)
 
     def update_device_list(self):
@@ -348,16 +357,38 @@ class InputDevicePanel(QGroupBox):
 
     def on_device_changed(self):
         device_idx = self.device_combo.currentData()
+        # Only track if device is enabled, not the specific index
+        self.config.input_device_enabled = (device_idx is not None)
+        
         if device_idx is not None:
-            self.device_changed.emit(device_idx)
-            self.config.device_input_index = device_idx
-            
             # Update channel selector
             device_info = sd.query_devices(device_idx)
             self.channel_combo.clear()
-            for i in range(device_info['max_input_channels']):
-                self.channel_combo.addItem(f"Channel {i+1}", i)
-            self.channel_combo.setVisible(device_info['max_input_channels'] > 1)
+            channels = device_info['max_input_channels']
+            if channels > 0:
+                for i in range(channels):
+                    self.channel_combo.addItem(f"Channel {i+1}", i)
+                self.channel_combo.setVisible(True)
+                self.channel_combo.setEnabled(channels > 1)  # Only enable selection if multiple channels
+            else:
+                self.channel_combo.setVisible(False)
+        else:
+            # Hide channel selector when no device is selected
+            self.channel_combo.setVisible(False)
+            
+        # Always emit the signal to trigger UI updates
+        self.device_changed.emit(-1 if device_idx is None else device_idx)
+
+    def get_current_settings(self) -> Dict[str, Any]:
+        """Get current panel settings"""
+        return {
+            'input_device': self.device_combo.get_device_info()
+        }
+
+    def apply_settings(self, settings: Dict[str, Any]):
+        """Apply loaded settings"""
+        if 'input_device' in settings:
+            self.device_combo.set_device_from_info(settings['input_device'])
 
 class SourcePanel(QGroupBox):
     source_changed = pyqtSignal()
@@ -368,76 +399,128 @@ class SourcePanel(QGroupBox):
         self.config = config
         self.is_playing = False
         self.current_source = None
-        self.export_settings = {}  # Initialize empty export settings
+        self.export_settings = {}
         
-        # Create MonitoringPanel and InputDevicePanel
+        # Set fixed size policy for the panel
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        
+        # Create panels with fixed size policies
         self.monitoring_panel = MonitoringPanel(config)
+        self.monitoring_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        
         self.input_device_panel = InputDevicePanel(config)
-        
-        # Hide input device panel initially
+        self.input_device_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.input_device_panel.hide()
-        
-        # Initialize cpp_template with default values
+
+        # Initialize cpp_template using default template
+        default_template = CppTemplate.get_default_templates()[0]
         self.cpp_template = {
+            'template_text': default_template.before + default_template.after,
+            'var_name': default_template.var_name,
+            'length_name': default_template.length_name
+        }
+        
+        # Initialize carousel template with default values
+        self.carousel_template = {
             'template_text': (
-                "// Auto-generated audio data header\n"
-                "#pragma once\n\n"
-                "#define {length_name} {length}  // Array length\n\n"
-                "// Audio samples normalized to int16 (-32768 to 32767)\n"
-                "const int16_t {var_name}[{length_name}] = {{\n"
-                "{array_data}\n"
-                "}};\n"
+                "#define SAMPLE_RATE 44100\n"
+                "#define NUM_BUFFERS @{num_buffers}\n"
+                "#define MONO_SAMPLES @{samples_per_buffer}  // Samples per buffer\n"
+                "#define STEREO_SAMPLES (MONO_SAMPLES * 2)\n"
+                "#define SILENCE_SAMPLES @{silence_samples}\n\n"
+                "// Noise samples for carousel playback\n"
+                "// Generated with @{generator_type}\n\n"
+                "int16_t @{buffer_name}[@{samples_per_buffer}] = {@{data}};\n\n"
+                "int16_t @{silence_buffer_name}[SILENCE_SAMPLES] = {@{silence_data}};\n"
+                "int16_t* @{buffer_array_name}[NUM_BUFFERS] = {@{buffer_list}};\n"
+                "int currentBufferIndex = 0;\n"
             ),
-            'var_name': 'audioData',
-            'length_name': 'AUDIO_LENGTH'
+            'buffer_name_format': 'buffer@{index+1}',
+            'buffer_array_name': 'noiseBuffers',
+            'silence_buffer_name': 'silenceBuffer'
         }
         
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-
-        # Mode selector and export group
-        mode_group = QHBoxLayout()
+        layout.setSpacing(6)  # Increased spacing between sections
+        layout.setContentsMargins(6, 8, 6, 8)  # Increased margins
         
         # Source type selector
+        source_layout = QHBoxLayout()
+        source_layout.setSpacing(8)  # Space between label and combo
+        source_label = QLabel("Source Type:")
         self.source_type = QComboBox()
         self.source_type.addItems(["White Noise", "Spectral Synthesis", "Test Mode"])
-        mode_group.addWidget(QLabel("Mode:"))
-        mode_group.addWidget(self.source_type)
+        self.source_type.currentTextChanged.connect(self.on_source_type_changed)
+        source_layout.addWidget(source_label)
+        source_layout.addWidget(self.source_type)
+        layout.addLayout(source_layout)
+        
+        # Add spacing before monitoring panel
+        layout.addSpacing(4)
+        
+        # Add monitoring panel
+        layout.addWidget(self.monitoring_panel)
+        
+        # Add spacing before input device panel
+        layout.addSpacing(4)
+        
+        # Add input device panel (initially hidden)
+        layout.addWidget(self.input_device_panel)
+        
+        # Connect device change signals
+        self.monitoring_panel.device_combo.currentIndexChanged.connect(self.on_output_device_changed)
+        self.input_device_panel.device_combo.currentIndexChanged.connect(self.on_input_device_changed)
+        
+        # Export button container - separate from mode selector
+        export_container = QWidget()
+        export_layout = QHBoxLayout(export_container)
+        export_layout.setContentsMargins(0, 0, 0, 0)
         
         # Export button - only for noise modes
         self.export_button = QPushButton("Export...")
         self.export_button.clicked.connect(self.export_noise)
-        mode_group.addWidget(self.export_button)
+        self.export_button.setFixedWidth(100)  # Set fixed width for consistency
         
-        layout.addLayout(mode_group)
+        # Create invisible placeholder with same size
+        self.export_placeholder = QWidget()
+        self.export_placeholder.setFixedWidth(100)
+        self.export_placeholder.hide()
+        
+        export_layout.addWidget(self.export_button)
+        export_layout.addWidget(self.export_placeholder)
+        export_layout.addStretch()  # Add stretch to keep button left-aligned
+        
+        layout.addWidget(export_container)
 
-        # Add RNG type selector between mode group and amplitude control
-        rng_layout = QHBoxLayout()
+        # Create container widget for RNG controls
+        self.rng_container = QWidget()
+        rng_layout = QHBoxLayout(self.rng_container)
+        rng_layout.setContentsMargins(0, 0, 0, 0)
         rng_layout.addWidget(QLabel("RNG Type:"))
         self.rng_type = QComboBox()
-        self.rng_type.addItems(["Standard Normal", "Uniform"])
+        self.rng_type.addItems(["Uniform", "Standard Normal"])
+        # Set initial value from config
+        initial_rng = "Uniform" if self.config.rng_type == 'uniform' else "Standard Normal"
+        self.rng_type.setCurrentText(initial_rng)
         self.rng_type.currentTextChanged.connect(self.on_rng_type_changed)
         rng_layout.addWidget(self.rng_type)
-        layout.addLayout(rng_layout)
+        layout.addWidget(self.rng_container)
 
-        # Add amplitude control between mode group and monitoring panel
-        amp_layout = QHBoxLayout()
+        # Create container widget for amplitude controls
+        self.amp_container = QWidget()
+        amp_layout = QHBoxLayout(self.amp_container)
+        amp_layout.setContentsMargins(0, 0, 0, 0)
         amp_layout.addWidget(QLabel("Amplitude:"))
         self.amplitude_control = QDoubleSpinBox()
         self.amplitude_control.setRange(0.0, 1.0)
-        self.amplitude_control.setValue(0.5)  # Default to 0.5 like DIY examples
+        self.amplitude_control.setValue(self.config.amp_whitenoise)
         self.amplitude_control.setSingleStep(0.1)
         self.amplitude_control.valueChanged.connect(self.on_amplitude_changed)
         amp_layout.addWidget(self.amplitude_control)
-        layout.addLayout(amp_layout)
-
-        # Add input device panel (for test mode)
-        layout.addWidget(self.input_device_panel)
-        
-        # Add monitoring panel
-        layout.addWidget(self.monitoring_panel)
+        layout.addWidget(self.amp_container)
 
         # Play/Stop button
         self.play_button = QPushButton("Play")
@@ -449,21 +532,105 @@ class SourcePanel(QGroupBox):
         self.source_type.currentTextChanged.connect(self.on_source_type_changed)
         self.monitoring_panel.monitoring_changed.connect(self.on_monitoring_changed)
         self.monitoring_panel.volume_changed.connect(self.on_volume_changed)
-        self.input_device_panel.device_changed.connect(lambda x: self.update_controls())
+        self.input_device_panel.device_changed.connect(self.on_device_changed)  # Add this line
         
-        # Initial control state
-        self.update_controls()
+        # Initialize UI state based on current source type
+        self.on_source_type_changed(self.source_type.currentText())
+
+    def _settings_changed(self, old_settings: dict, new_settings: dict) -> bool:
+        """Deep compare export settings to detect changes"""
+        if old_settings is None:
+            logger.debug("Export settings changed: old settings were None")
+            return True
+            
+        # List of all settings to compare
+        basic_settings = [
+            'duration', 'sample_rate', 'base_amplitude', 'amplitude',
+            'attenuation', 'enable_attenuation',
+            'export_wav', 'export_cpp',
+            'enable_fade_in', 'enable_fade_out', 'enable_fade',
+            'fade_in_duration', 'fade_out_duration',
+            'fade_in_power', 'fade_out_power',
+            'enable_normalization', 'normalize_value',
+            'fade_before_norm', 'use_random_seed', 'seed',
+            'rng_type', 'folder_path', 'wav_filename', 'cpp_filename',
+            'header_filename', 'carousel_enabled', 'carousel_samples',
+            'carousel_noise_duration_ms', 'silence_duration_ms',
+            'export_combined', 'export_individual', 'global_normalization'
+        ]
+        
+        # Compare basic settings
+        for key in basic_settings:
+            old_value = old_settings.get(key)
+            new_value = new_settings.get(key)
+            if old_value != new_value:
+                logger.debug(f"Setting changed: {key} from {old_value} to {new_value}")
+                return True
+            
+        # Compare templates if they exist
+        old_cpp = old_settings.get('cpp_template')
+        new_cpp = new_settings.get('cpp_template')
+        
+        # If either template is None, but they're different, settings have changed
+        if (old_cpp is None) != (new_cpp is None):
+            logger.debug("One template is None while other isn't - settings changed")
+            return True
+
+        # If both templates exist, compare their fields
+        if old_cpp is not None and new_cpp is not None:
+            cpp_fields = ['template_text', 'var_name', 'length_name']
+            for field in cpp_fields:
+                if old_cpp.get(field) != new_cpp.get(field):
+                    logger.debug(f"C++ template changed: {field}")
+                    return True
+            
+        # Compare carousel template if present
+        old_carousel = old_settings.get('carousel_template')
+        new_carousel = new_settings.get('carousel_template')
+        
+        # If either carousel template is None, but they're different, settings changed
+        if (old_carousel is None) != (new_carousel is None):
+            logger.debug("One carousel template is None while other isn't - settings changed")
+            return True
+
+        # If both carousel templates exist, compare their fields
+        if old_carousel is not None and new_carousel is not None:
+            carousel_fields = ['template_text', 'buffer_name_format', 'buffer_array_name', 'silence_buffer_name']
+            for field in carousel_fields:
+                if old_carousel.get(field) != new_carousel.get(field):
+                    logger.debug(f"Carousel template changed: {field}")
+                    return True
+            
+        # Compare filters if present
+        old_filters = old_settings.get('filters', [])
+        new_filters = new_settings.get('filters', [])
+        if len(old_filters) != len(new_filters):
+            logger.debug(f"Number of filters changed from {len(old_filters)} to {len(new_filters)}")
+            return True
+            
+        for old_filter, new_filter in zip(old_filters, new_filters):
+            for key in ['type', 'cutoff', 'order', 'amplitude', 'q', 'lowcut', 'highcut',
+                       'center_freq', 'width', 'skew', 'kurtosis', 'flatness', 'flat_width']:
+                if old_filter.get(key) != new_filter.get(key):
+                    logger.debug(f"Filter setting changed: {key}")
+                    return True
+                    
+        logger.debug("No export settings changed")
+        return False
 
     def export_noise(self):
         """Trigger appropriate export dialog based on source type"""
         try:
+            logger.debug("Starting export_noise with export_settings: %s", self.export_settings)  # Debug print
             source_type = self.get_source_type()
             dialog = ExportDialog(self, mode=source_type)
             
             # Apply stored settings and current mode's amplitude
             if self.export_settings:
+                logger.debug("Applying saved settings: %s", self.export_settings)  # Debug print
                 dialog.apply_saved_settings(self.export_settings)
             else:
+                logger.debug("No saved settings found, using current amplitude")  # Debug print
                 # Initialize with current amplitude
                 current_amp = (self.config.amp_whitenoise 
                              if source_type == "White Noise" 
@@ -475,16 +642,33 @@ class SourcePanel(QGroupBox):
             
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 settings = dialog.get_settings()
-                # Store settings for reuse
-                self.export_settings = settings
+                logger.debug("Got new settings from dialog: %s", settings)  # Debug print
+                # Check if settings have changed using deep comparison
+                if self._settings_changed(self.export_settings, settings):
+                    logger.debug("Settings changed, storing new settings")  # Debug print
+                    # Store settings for reuse
+                    self.export_settings = settings.copy()  # Make a copy to avoid reference issues
+                    # Save to QSettings immediately
+                    qsettings = QSettings('YourOrg', 'SpectrumAnalyzer')
+                    qsettings.setValue('export_settings', self.export_settings)
+                    # Mark project as dirty
+                    parent = self.parent()
+                    while parent:
+                        if hasattr(parent, 'mark_unsaved_changes'):
+                            parent.mark_unsaved_changes()
+                            break
+                        parent = parent.parent()
                 self.export_requested.emit(settings)
-                
         except Exception as e:
-            print(f"Export dialog error: {e}")
+            logger.error("Export dialog error: %s", e, exc_info=True)  # Added exc_info for full traceback
 
     def on_source_type_changed(self, new_type: str):
         """Handle source type changes with mode-specific amplitude"""
-        self.export_button.setVisible(new_type != "Test Mode")
+        is_test_mode = new_type == "Test Mode"
+        
+        # Update visibility of export button
+        self.export_button.setVisible(not is_test_mode)
+        self.export_placeholder.setVisible(is_test_mode)
         
         # Update amplitude based on mode
         if new_type == "White Noise":
@@ -496,105 +680,125 @@ class SourcePanel(QGroupBox):
         if self.is_playing:
             self.toggle_playback()
             
-        # Update control states
-        self.update_controls()
-
-    def update_controls(self):
-        """Update control states based on current settings"""
-        source_type = self.source_type.currentText()
-        is_test_mode = source_type == "Test Mode"
-        
         # Show/hide panels based on mode
         self.input_device_panel.setVisible(is_test_mode)
-        self.export_button.setVisible(not is_test_mode)
+        self.rng_container.setVisible(not is_test_mode)
+        self.amp_container.setVisible(not is_test_mode)
         
-        # Update play button state
-        if (is_test_mode):
-            # Enable play button only if an input device is selected
+        # Update play button state for test mode
+        if is_test_mode:
             device_idx = self.input_device_panel.device_combo.currentData()
             self.play_button.setEnabled(device_idx is not None)
         else:
-            # For noise modes, always enable play button
             self.play_button.setEnabled(True)
 
+    def on_input_device_changed(self):
+        """Handle input device changes"""
+        device_idx = self.input_device_panel.device_combo.currentData()
+        self.config.input_device_enabled = (device_idx is not None)
+        
+        # Update play button state in test mode
+        if self.source_type.currentText() == "Test Mode":
+            self.play_button.setEnabled(device_idx is not None)
+            
+        # Stop playback if device is removed while playing
+        if device_idx is None and self.is_playing:
+            self.toggle_playback()
+
+    def on_output_device_changed(self):
+        """Handle output device changes"""
+        if self.current_source and hasattr(self.current_source, 'update_output_device'):
+            self.current_source.update_output_device()
+
     def get_current_settings(self) -> Dict[str, Any]:
-        """Returns current source settings with both amplitudes"""
+        """Get current panel settings"""
         settings = {
             'source_type': self.source_type.currentText(),
-            'monitoring': self.monitoring_panel.get_current_settings(),
-            'input_device': self.input_device_panel.device_combo.currentData(),
+            'monitoring_enabled': self.monitoring_panel.monitor_checkbox.isChecked(),
+            'monitoring_volume': self.monitoring_panel.volume_slider.value(),
+            'output_device': self.monitoring_panel.device_combo.get_device_info(),
+            'input_device': self.input_device_panel.device_combo.get_device_info(),
             'amp_whitenoise': self.config.amp_whitenoise,
             'amp_spectral': self.config.amp_spectral,
             'rng_type': self.rng_type.currentText().lower().replace(' ', '_'),
-            'cpp_template': self.cpp_template  # Add template settings
+            'cpp_template': self.cpp_template,
+            'carousel_template': self.carousel_template
         }
         return settings
 
     def apply_settings(self, settings: Dict[str, Any]):
-        """Applies loaded settings with both amplitudes"""
+        """Apply loaded settings"""
         if 'source_type' in settings:
             index = self.source_type.findText(settings['source_type'])
             if index >= 0:
                 self.source_type.setCurrentIndex(index)
+                
+        # Apply monitoring panel settings
+        monitoring_settings = {
+            'monitoring_enabled': settings.get('monitoring_enabled', False),
+            'monitoring_volume': settings.get('monitoring_volume', 50),
+            'output_device': settings.get('output_device', None)
+        }
+        self.monitoring_panel.apply_settings(monitoring_settings)
         
-        if 'monitoring' in settings:
-            self.monitoring_panel.apply_settings(settings['monitoring'])
-            
-        # Update control states
-        self.update_controls()
+        # Apply input device panel settings
+        input_settings = {
+            'input_device': settings.get('input_device', None)
+        }
+        self.input_device_panel.apply_settings(input_settings)
         
-        # Store both amplitudes
+        # Apply amplitude settings
         if 'amp_whitenoise' in settings:
             self.config.amp_whitenoise = settings['amp_whitenoise']
+            if self.source_type.currentText() == "White Noise":
+                self.amplitude_control.setValue(settings['amp_whitenoise'])
+                
         if 'amp_spectral' in settings:
             self.config.amp_spectral = settings['amp_spectral']
-            
-        # Set the right amplitude for current mode
-        source_type = self.source_type.currentText()
-        if source_type == "White Noise":
-            self.amplitude_control.setValue(self.config.amp_whitenoise)
-        elif source_type == "Spectral Synthesis":
-            self.amplitude_control.setValue(self.config.amp_spectral)
-            
+            if self.source_type.currentText() == "Spectral Synthesis":
+                self.amplitude_control.setValue(settings['amp_spectral'])
+                
+        # Apply RNG type if present
         if 'rng_type' in settings:
-            index = self.rng_type.findText(settings['rng_type'].replace('_', ' ').title())
+            rng_type = settings['rng_type']
+            if isinstance(rng_type, str):
+                rng_type = rng_type.title().replace('_', ' ')
+            index = self.rng_type.findText(rng_type)
             if index >= 0:
                 self.rng_type.setCurrentIndex(index)
+                self.config.rng_type = settings['rng_type']
                 
-        # Apply export settings if present
-        if 'export' in settings:
-            self.export_settings = settings['export'].copy()
-            
-        # Apply cpp template settings if present
+        # Apply template settings
         if 'cpp_template' in settings:
             self.cpp_template = settings['cpp_template']
+        if 'carousel_template' in settings:
+            self.carousel_template = settings['carousel_template']
 
     def on_device_changed(self):
         """Handle device selection changes"""
         device_idx = self.input_device_panel.device_combo.currentData()
-        if device_idx is not None:
-            device_info = sd.query_devices(device_idx)
-            
-            # Update input channel selector
-            if self.source_type.currentText() == "Microphone/Line In":
-                self.input_device_panel.channel_combo.clear()
-                for i in range(device_info['max_input_channels']):
-                    self.input_device_panel.channel_combo.addItem(f"Channel {i+1}", i)
-                self.input_device_panel.channel_combo.setVisible(device_info['max_input_channels'] > 1)
-
-            # Update config and current source if running
-            self.config.device_output_index = device_idx
-            self.config.output_device_enabled = True
-            if self.current_source and hasattr(self.current_source, 'update_output_device'):
-                self.current_source.update_output_device()
         
-        # Update control states
-        self.update_controls()
+        # Stop playback if no device is selected and we're currently playing
+        if device_idx is None and self.is_playing:
+            self.toggle_playback()  # Stop playback
+            
+        # Only track if device is enabled, not the specific index
+        self.config.input_device_enabled = (device_idx is not None)
+        
+        # Update current source if running
+        if self.current_source and hasattr(self.current_source, 'update_output_device'):
+            self.current_source.update_output_device()
+        
+        # Update play button state if in test mode
+        if self.source_type.currentText() == "Test Mode":
+            self.play_button.setEnabled(device_idx is not None)
 
     def toggle_playback(self):
+        """Toggle playback state"""
         try:
             if self.is_playing:
-                # First set button state
+                logger.debug("Stopping playback")
+                # Update button first
                 self.play_button.setText("Play")
                 self.play_button.setChecked(False)
                 self.is_playing = False
@@ -608,8 +812,13 @@ class SourcePanel(QGroupBox):
                         self.current_source.close()
                     finally:
                         self.current_source = None
-                
+                        
+                # Re-enable device selection
+                self.monitoring_panel.device_combo.setEnabled(True)
+                self.input_device_panel.device_combo.setEnabled(True)
+
             else:
+                logger.debug("Starting playback")
                 # Get the current monitoring device
                 output_device_idx = self.monitoring_panel.device_combo.currentData()
                 input_device_idx = self.input_device_panel.device_combo.currentData()
@@ -637,12 +846,25 @@ class SourcePanel(QGroupBox):
                 self.play_button.setChecked(True)
                 self.is_playing = True
                 
+                # Disable device selection during playback
+                self.monitoring_panel.device_combo.setEnabled(False)
+                self.input_device_panel.device_combo.setEnabled(False)
+                
                 # Finally emit signal to start processing
                 self.source_changed.emit()
 
         except Exception as e:
-            print(f"Playback toggle error: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Playback error: {str(e)}")
+            logger.error(f"Playback toggle error: {str(e)}")
+            error_msg = str(e)
+            # Check if it's a PortAudio error and provide a more user-friendly message
+            if "PaErrorCode" in error_msg:
+                if "Invalid sample rate" in error_msg:
+                    error_msg = "The selected audio device does not support the current sample rate (44.1kHz).\nPlease select a different audio device."
+                elif "Illegal combination of I/O devices" in error_msg:
+                    error_msg = "The selected audio device configuration is not supported.\nPlease try a different audio device."
+                else:
+                    error_msg = f"Audio device error: {error_msg}"
+            QMessageBox.critical(self, "Error", error_msg)
             self.is_playing = False
             self.play_button.setText("Play")
             self.play_button.setChecked(False)
@@ -651,6 +873,9 @@ class SourcePanel(QGroupBox):
                     self.current_source.close()
                 finally:
                     self.current_source = None
+            # Re-enable device selection on error
+            self.monitoring_panel.device_combo.setEnabled(True)
+            self.input_device_panel.device_combo.setEnabled(True)
 
     def handle_source_reference(self, source):
         """Store reference to current source"""
@@ -663,28 +888,28 @@ class SourcePanel(QGroupBox):
     def on_monitoring_changed(self, enabled: bool):
         """Handle monitoring toggle"""
         try:
-            # Update config
             self.config.monitoring_enabled = enabled
-            self.config.output_device_enabled = True  # Enable output device
-            
-            # Get the current output device
-            device_idx = self.monitoring_panel.device_combo.currentData()
-            self.config.device_output_index = device_idx
-            
-            # If we have an active source with monitoring capability, update it
             if self.current_source:
-                if hasattr(self.current_source, 'update_output_device'):
-                    self.current_source.update_output_device()
-                if hasattr(self.current_source, 'update_monitoring'):
-                    self.current_source.update_monitoring()
-                
+                self.current_source.update_output_device()
         except Exception as e:
-            print(f"Monitoring toggle error: {e}")
-            # Revert checkbox state if there was an error
-            self.monitoring_panel.monitor_checkbox.blockSignals(True)
+            logger.error(f"Monitoring toggle error: {e}")
+            error_msg = str(e)
+            # Check if it's a PortAudio error and provide a more user-friendly message
+            if "PaErrorCode" in error_msg:
+                if "Invalid sample rate" in error_msg:
+                    error_msg = "The selected audio device does not support the current sample rate (44.1kHz).\nPlease select a different audio device."
+                elif "Illegal combination of I/O devices" in error_msg:
+                    error_msg = "The selected audio device configuration is not supported.\nPlease try a different audio device."
+                else:
+                    error_msg = f"Audio device error: {error_msg}"
+            QMessageBox.critical(self, "Error", error_msg)
+            # Reset checkbox state
             self.monitoring_panel.monitor_checkbox.setChecked(not enabled)
-            self.monitoring_panel.monitor_checkbox.blockSignals(False)
-            raise
+            self.config.monitoring_enabled = not enabled
+            
+            # Stop playback if running and re-enable device selection
+            if self.is_playing:
+                self.toggle_playback()  # This will stop playback and re-enable device selection
 
     def get_source_type(self) -> str:
         """Returns the current source type"""
@@ -712,44 +937,193 @@ class AnalyzerPanel(QGroupBox):
     def __init__(self, config: AudioConfig):
         super().__init__("Analyzer Settings")
         self.config = config
+        self.decay_rate = None
+        # Set fixed size policy for the entire panel
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.init_ui()
 
     def init_ui(self):
-        layout = QFormLayout(self)
+        layout = QVBoxLayout()
+        layout.setSpacing(2)  # Reduced spacing between sections
+        layout.setContentsMargins(4, 6, 4, 6)  # Reduced margins
 
-        # Analysis Settings
-        analysis_group = QGroupBox("FFT Analysis")
-        analysis_layout = QFormLayout(analysis_group)
-        
-        # FFT Size
+        # Create a grid layout for the main controls
+        grid = QGridLayout()
+        grid.setSpacing(4)  # Minimal spacing between elements
+
+        # FFT Size selection
+        fft_label = QLabel("FFT Size:")
         self.fft_size = QComboBox()
-        self.fft_size.addItems(['128', '256', '512', '1024', '2048', '4096', '8192'])  # Added smaller sizes
+        self.fft_size.addItems(['128', '256', '512', '1024', '2048', '4096', '8192'])
         self.fft_size.setCurrentText(str(self.config.fft_size))
-        self.fft_size.currentTextChanged.connect(self.on_settings_changed)
-        analysis_layout.addRow("FFT Size:", self.fft_size)
+        self.fft_size.currentTextChanged.connect(self.on_fft_size_changed)
+        grid.addWidget(fft_label, 0, 0)
+        grid.addWidget(self.fft_size, 0, 1)
 
-        # Window Type
-        self.window_type = QComboBox()
-        self.window_type.addItems(['hanning', 'hamming', 'blackman', 'flattop', 'rectangular'])
-        self.window_type.setCurrentText(self.config.window_type)
-        self.window_type.currentTextChanged.connect(self.on_window_changed)
-        analysis_layout.addRow("Window:", self.window_type)
-
-        # Scale Type
+        # Scale type selection
+        scale_label = QLabel("Scale:")
         self.scale_type = QComboBox()
-        self.scale_type.addItems(['Linear', 'Logarithmic'])
+        self.scale_type.addItems(["Linear", "Logarithmic"])
+        self.scale_type.setCurrentText(self.config.scale_type.title())
         self.scale_type.currentTextChanged.connect(self.on_scale_changed)
-        analysis_layout.addRow("Scale:", self.scale_type)
+        grid.addWidget(scale_label, 1, 0)
+        grid.addWidget(self.scale_type, 1, 1)
 
-        # Averaging
-        self.averaging = QSpinBox()
-        self.averaging.setRange(1, 16)
-        self.averaging.setValue(self.config.averaging_count)
+        # Window type selection
+        window_label = QLabel("Window:")
+        self.window_type = QComboBox()
+        self.window_type.addItems(["Hanning", "Hamming", "Blackman", "Rectangular", "Flattop"])
+        self.window_type.setCurrentText(self.config.window_type.title())
+        self.window_type.currentTextChanged.connect(self.on_window_changed)
+        grid.addWidget(window_label, 2, 0)
+        grid.addWidget(self.window_type, 2, 1)
+
+        layout.addLayout(grid)
+
+        # Averaging control in a horizontal layout
+        averaging_layout = QHBoxLayout()
+        averaging_layout.setSpacing(4)
+        averaging_label = QLabel("Averaging:")
+        self.averaging = ParameterControl(1, 32, self.config.averaging_count, decimals=0, suffix=" frames")
         self.averaging.valueChanged.connect(self.on_settings_changed)
-        analysis_layout.addRow("Averaging:", self.averaging)
+        self.averaging.setFixedHeight(24)  # Reduced height
+        averaging_layout.addWidget(averaging_label)
+        averaging_layout.addWidget(self.averaging)
+        layout.addLayout(averaging_layout)
+
+        # Add decay rate control
+        self.decay_group = QGroupBox("Spectrum Decay")
+        decay_layout = QVBoxLayout()
+        decay_layout.setSpacing(1)
+        decay_layout.setContentsMargins(2, 4, 2, 2)
         
-        layout.addRow(analysis_group)
+        # Add enable checkbox in a more compact layout
+        decay_header = QHBoxLayout()
+        decay_header.setSpacing(2)
+        self.decay_enabled = QCheckBox("Enable")
+        self.decay_enabled.setChecked(False)
+        self.decay_enabled.stateChanged.connect(self.on_decay_enabled_changed)
+        decay_header.addWidget(self.decay_enabled)
+        decay_layout.addLayout(decay_header)
         
+        # Add rate control with reduced height
+        self.decay_rate = ParameterControl(0.01, 1.0, 0.1, decimals=2, suffix=" decay")
+        self.decay_rate.setEnabled(False)
+        self.decay_rate.setFixedHeight(24)
+        decay_layout.addWidget(self.decay_rate)
+        
+        self.decay_group.setLayout(decay_layout)
+        layout.addWidget(self.decay_group)
+
+        # Add trigger controls with reduced size
+        self.trigger_group = QGroupBox("Trigger")
+        trigger_layout = QVBoxLayout()
+        trigger_layout.setSpacing(1)
+        trigger_layout.setContentsMargins(2, 4, 2, 2)
+        
+        # Add trigger enable checkbox in a compact header
+        trigger_header = QHBoxLayout()
+        trigger_header.setSpacing(2)
+        self.trigger_enabled = QCheckBox("Enable")
+        self.trigger_enabled.setChecked(False)
+        self.trigger_enabled.stateChanged.connect(self.on_trigger_enabled_changed)
+        trigger_header.addWidget(self.trigger_enabled)
+        trigger_layout.addLayout(trigger_header)
+        
+        # Add trigger level control with reduced height
+        self.trigger_level = ParameterControl(-120, 0, -45, decimals=1, suffix=" dB")
+        self.trigger_level.setEnabled(False)
+        self.trigger_level.setFixedHeight(24)
+        trigger_layout.addWidget(self.trigger_level)
+        
+        # Add trigger mode controls in a grid layout
+        trigger_grid = QGridLayout()
+        trigger_grid.setSpacing(2)
+
+        mode_label = QLabel("Reset:")
+        self.trigger_reset_mode = QComboBox()
+        self.trigger_reset_mode.addItems(["Hold Time", "Next Trigger", "Manual"])
+        self.trigger_reset_mode.setEnabled(False)
+        self.trigger_reset_mode.setFixedHeight(22)
+        self.trigger_reset_mode.currentTextChanged.connect(self.on_trigger_reset_mode_changed)
+        trigger_grid.addWidget(mode_label, 0, 0)
+        trigger_grid.addWidget(self.trigger_reset_mode, 0, 1)
+
+        edge_label = QLabel("Edge:")
+        self.trigger_edge_mode = QComboBox()
+        self.trigger_edge_mode.addItems(["Rising", "Falling", "Both"])
+        self.trigger_edge_mode.setEnabled(False)
+        self.trigger_edge_mode.setFixedHeight(22)
+        self.trigger_edge_mode.currentTextChanged.connect(self.on_trigger_edge_mode_changed)
+        trigger_grid.addWidget(edge_label, 1, 0)
+        trigger_grid.addWidget(self.trigger_edge_mode, 1, 1)
+        
+        trigger_layout.addLayout(trigger_grid)
+
+        # Add hold time control with reduced height
+        self.hold_time = ParameterControl(0.05, 1.0, 0.2, decimals=2, suffix=" sec")
+        self.hold_time.valueChanged.connect(self.on_hold_time_changed)
+        self.hold_time.setEnabled(False)
+        self.hold_time.setFixedHeight(24)
+        trigger_layout.addWidget(self.hold_time)
+        
+        # Add manual reset button with reduced height
+        self.reset_button = QPushButton("Reset Trigger")
+        self.reset_button.setEnabled(False)
+        self.reset_button.setFixedHeight(22)
+        self.reset_button.clicked.connect(self.on_manual_reset)
+        trigger_layout.addWidget(self.reset_button)
+        
+        self.trigger_group.setLayout(trigger_layout)
+        layout.addWidget(self.trigger_group)
+
+        # Initially hide decay and trigger controls
+        self.decay_group.hide()
+        self.trigger_group.hide()
+
+        self.setLayout(layout)
+
+    def show_test_mode_controls(self, show: bool = True):
+        """Show or hide test mode specific controls (decay and trigger)"""
+        if show:
+            self.decay_group.show()
+            self.trigger_group.show()
+        else:
+            # Disable controls when hiding
+            if self.decay_enabled.isChecked():
+                self.decay_enabled.setChecked(False)
+            if self.trigger_enabled.isChecked():
+                self.trigger_enabled.setChecked(False)
+            self.decay_group.hide()
+            self.trigger_group.hide()
+            
+        # No need to force layout updates or window resizing
+
+    def on_decay_enabled_changed(self, state: int):
+        """Handle decay enable/disable"""
+        enabled = state == Qt.CheckState.Checked.value
+        self.decay_rate.setEnabled(enabled)
+        
+        # Get the main window (which has the processor)
+        main_window = self.window()
+        if hasattr(main_window, 'processor'):
+            logger.debug(f"Setting decay enabled: {enabled}")
+            main_window.processor.set_decay_enabled(enabled)
+            self.on_settings_changed()
+        else:
+            logger.warning("Could not find processor to set decay enabled")
+
+    def on_decay_changed(self, value: float):
+        """Handle decay rate changes"""
+        # Get the main window (which has the processor)
+        main_window = self.window()
+        if hasattr(main_window, 'processor'):
+            logger.debug(f"Setting decay rate to: {value}")
+            main_window.processor.set_decay_rate(value)
+            self.on_settings_changed()
+        else:
+            logger.warning("Could not find processor to set decay rate")
+
     def on_scale_changed(self, new_scale: str):
         """Explicitly handle scale changes"""
         try:
@@ -758,39 +1132,109 @@ class AnalyzerPanel(QGroupBox):
             # Emit signal for parent to handle
             self.settings_changed.emit()
         except Exception as e:
-            print(f"Scale change error: {e}")
+            logger.error(f"Scale change error: {e}")
 
     def on_window_changed(self, window_type: str):
         """Explicitly handle window type changes"""
         try:
             # Update config
-            self.config.window_type = window_type
+            self.config.window_type = window_type.lower()  # Convert to lowercase to match config expectations
             # Emit signal for parent to handle
             self.settings_changed.emit()
         except Exception as e:
-            print(f"Window change error: {e}")
+            logger.error(f"Window change error: {e}")
 
     def on_settings_changed(self):
         """Signal that settings have changed"""
+        logger.debug(f"Settings changed - Current FFT size: {self.config.fft_size}")
         self.settings_changed.emit()
         # Notify parent of changes
         if hasattr(self.parent(), 'mark_unsaved_changes'):
             self.parent().mark_unsaved_changes()
 
-    def get_current_settings(self) -> Dict[str, Any]:
-        settings = {
-            'fft_size': int(self.fft_size.currentText()),
-            'window_type': self.window_type.currentText(),
-            'scale_type': self.scale_type.currentText().lower(),
-            'averaging_count': self.averaging.value()
+    def on_trigger_enabled_changed(self, state: int):
+        """Handle trigger enable/disable"""
+        enabled = state == Qt.CheckState.Checked.value
+        self.trigger_level.setEnabled(enabled)
+        self.hold_time.setEnabled(enabled)
+        self.trigger_reset_mode.setEnabled(enabled)
+        self.trigger_edge_mode.setEnabled(enabled)
+        self.reset_button.setEnabled(enabled)
+        
+        main_window = self.window()
+        if hasattr(main_window, 'processor'):
+            logger.debug(f"Setting trigger enabled: {enabled}")
+            main_window.processor.set_trigger_enabled(enabled)
+            self.on_settings_changed()
+
+    def on_trigger_reset_mode_changed(self, mode: str):
+        """Handle trigger reset mode changes"""
+        # Convert UI text to processor mode
+        mode_map = {
+            "Hold Time": "hold_time",
+            "Next Trigger": "next_trigger",
+            "Manual": "manual"
         }
-        return settings
+        main_window = self.window()
+        if hasattr(main_window, 'processor'):
+            main_window.processor.set_trigger_reset_mode(mode_map[mode])
+            # Show/hide hold time based on mode
+            self.hold_time.setEnabled(mode == "Hold Time" and self.trigger_enabled.isChecked())
+            self.on_settings_changed()
+
+    def on_trigger_edge_mode_changed(self, mode: str):
+        """Handle trigger edge mode changes"""
+        # Convert UI text to processor mode
+        mode_map = {
+            "Rising": "rising",
+            "Falling": "falling",
+            "Both": "both"
+        }
+        main_window = self.window()
+        if hasattr(main_window, 'processor'):
+            main_window.processor.set_trigger_edge_mode(mode_map[mode])
+            self.on_settings_changed()
+
+    def on_manual_reset(self):
+        """Handle manual trigger reset"""
+        main_window = self.window()
+        if hasattr(main_window, 'processor'):
+            main_window.processor.manual_trigger_reset()
+
+    def on_trigger_level_changed(self, value: float):
+        """Handle trigger level changes"""
+        main_window = self.window()
+        if hasattr(main_window, 'processor'):
+            main_window.processor.set_trigger_level(value)
+            self.on_settings_changed()
+
+    def on_hold_time_changed(self, value: float):
+        """Handle hold time changes"""
+        main_window = self.window()
+        if hasattr(main_window, 'processor'):
+            main_window.processor.set_hold_time(value)
+            self.on_settings_changed()
+
+    def get_current_settings(self) -> Dict[str, Any]:
+        return {
+            'fft_size': int(self.fft_size.currentText()),
+            'window_type': self.window_type.currentText().lower(),
+            'scale_type': self.scale_type.currentText().lower(),
+            'averaging_count': self.averaging.value(),
+            'decay_enabled': self.decay_enabled.isChecked(),
+            'decay_rate': self.decay_rate.value(),
+            'trigger_enabled': self.trigger_enabled.isChecked(),
+            'trigger_level': self.trigger_level.value(),
+            'hold_time': self.hold_time.value(),
+            'trigger_reset_mode': self.trigger_reset_mode.currentText(),
+            'trigger_edge_mode': self.trigger_edge_mode.currentText()
+        }
 
     def apply_settings(self, settings: Dict[str, Any]):
         if 'fft_size' in settings:
             self.fft_size.setCurrentText(str(settings['fft_size']))
         if 'window_type' in settings:
-            index = self.window_type.findText(settings['window_type'])
+            index = self.window_type.findText(settings['window_type'].title())
             if index >= 0:
                 self.window_type.setCurrentIndex(index)
         if 'scale_type' in settings:
@@ -799,12 +1243,42 @@ class AnalyzerPanel(QGroupBox):
                 self.scale_type.setCurrentIndex(index)
         if 'averaging_count' in settings:
             self.averaging.setValue(settings['averaging_count'])
+        if 'decay_enabled' in settings:
+            self.decay_enabled.setChecked(settings['decay_enabled'])
+        if 'decay_rate' in settings:
+            self.decay_rate.setValue(settings['decay_rate'])
+        if 'trigger_enabled' in settings:
+            self.trigger_enabled.setChecked(settings['trigger_enabled'])
+        if 'trigger_level' in settings:
+            self.trigger_level.setValue(settings['trigger_level'])
+        if 'hold_time' in settings:
+            self.hold_time.setValue(settings['hold_time'])
+        if 'trigger_reset_mode' in settings:
+            index = self.trigger_reset_mode.findText(settings['trigger_reset_mode'])
+            if index >= 0:
+                self.trigger_reset_mode.setCurrentIndex(index)
+        if 'trigger_edge_mode' in settings:
+            index = self.trigger_edge_mode.findText(settings['trigger_edge_mode'])
+            if index >= 0:
+                self.trigger_edge_mode.setCurrentIndex(index)
+
+    def on_fft_size_changed(self, size: str):
+        """Handle FFT size changes"""
+        try:
+            new_size = int(size)
+            logger.debug("FFT size changed:")
+            logger.debug(f"- Old size: {self.config.fft_size}")
+            logger.debug(f"- New size: {new_size}")
+            self.config.fft_size = new_size
+            self.on_settings_changed()
+        except Exception as e:
+            logger.error(f"FFT size change error: {e}")
 
 class FilterParamDialog(QDialog):
     def __init__(self, filter_params: dict, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)
         self.setWindowTitle("Edit Filter Parameters")
-        self.setModal(True)
         self.params = filter_params
         self.init_ui()
 
@@ -882,10 +1356,10 @@ class FilterWidget(QFrame):
         if self.filter_type in ['lowpass', 'highpass']:
             self.param_widgets['cutoff'] = ParameterControl(20.0, 20000.0, self.params.get('cutoff', 1000.0), 0, " Hz")
             self.param_widgets['order'] = ParameterControl(1, 8, self.params.get('order', 4), 0)
-            self.param_widgets['amplitude'] = ParameterControl(0.0, 1.0, self.params.get('amplitude', 1.0), 2, "", 0.1)
+            self.param_widgets['gain_db'] = ParameterControl(-120.0, 0.0, self.params.get('gain_db', 0.0), 1, " dB", 0.1)
             params_layout.addRow("Cutoff:", self.param_widgets['cutoff'])
             params_layout.addRow("Order:", self.param_widgets['order'])
-            params_layout.addRow("Amplitude:", self.param_widgets['amplitude'])
+            params_layout.addRow("Gain:", self.param_widgets['gain_db'])
 
         elif self.filter_type == 'bandpass':
             # Create controls with linking
@@ -901,24 +1375,24 @@ class FilterWidget(QFrame):
             self.param_widgets['lowcut'].linked_control = self.param_widgets['highcut']
             self.param_widgets['highcut'].linked_control = self.param_widgets['lowcut']
             self.param_widgets['order'] = ParameterControl(1, 8, self.params.get('order', 4), 0)
-            self.param_widgets['amplitude'] = ParameterControl(0.0, 1.0, self.params.get('amplitude', 1.0), 2, "", 0.1)
+            self.param_widgets['gain_db'] = ParameterControl(-120.0, 0.0, self.params.get('gain_db', 0.0), 1, " dB", 0.1)
             params_layout.addRow("Low Cut:", self.param_widgets['lowcut'])
             params_layout.addRow("High Cut:", self.param_widgets['highcut'])
             params_layout.addRow("Order:", self.param_widgets['order'])
-            params_layout.addRow("Amplitude:", self.param_widgets['amplitude'])
+            params_layout.addRow("Gain:", self.param_widgets['gain_db'])
 
         elif self.filter_type == 'notch':
             self.param_widgets['freq'] = ParameterControl(20.0, 20000.0, self.params.get('freq', 1000.0), 0, " Hz")
             self.param_widgets['q'] = ParameterControl(0.1, 100.0, self.params.get('q', 30.0), 1)
-            self.param_widgets['amplitude'] = ParameterControl(0.0, 1.0, self.params.get('amplitude', 1.0), 2, "", 0.1)
+            self.param_widgets['gain_db'] = ParameterControl(-120.0, 0.0, self.params.get('gain_db', 0.0), 1, " dB", 0.1)
             params_layout.addRow("Frequency:", self.param_widgets['freq'])
             params_layout.addRow("Q Factor:", self.param_widgets['q'])
-            params_layout.addRow("Amplitude:", self.param_widgets['amplitude'])
+            params_layout.addRow("Gain:", self.param_widgets['gain_db'])
 
         elif self.filter_type in ['gaussian', 'parabolic']:
             self.param_widgets['center_freq'] = ParameterControl(20.0, 20000.0, self.params.get('center_freq', 1000.0), 0, " Hz")
             self.param_widgets['width'] = ParameterControl(1.0, 5000.0, self.params.get('width', 100.0), 0, " Hz")
-            self.param_widgets['amplitude'] = ParameterControl(0.0, 1.0, self.params.get('amplitude', 0.5), 2, "", 0.1)
+            self.param_widgets['gain_db'] = ParameterControl(-120.0, 0.0, self.params.get('gain_db', 0.0), 1, " dB", 0.1)
             self.param_widgets['skew'] = ParameterControl(-5.0, 5.0, self.params.get('skew', 0.0), 2)
             if self.filter_type == 'gaussian':
                 self.param_widgets['kurtosis'] = ParameterControl(0.2, 5.0, self.params.get('kurtosis', 1.0), 2)
@@ -927,12 +1401,23 @@ class FilterWidget(QFrame):
             
             params_layout.addRow("Center:", self.param_widgets['center_freq'])
             params_layout.addRow("Width:", self.param_widgets['width'])
-            params_layout.addRow("Amplitude:", self.param_widgets['amplitude'])
+            params_layout.addRow("Gain:", self.param_widgets['gain_db'])
             params_layout.addRow("Skew:", self.param_widgets['skew'])
             if self.filter_type == 'gaussian':
                 params_layout.addRow("Kurtosis:", self.param_widgets['kurtosis'])
             else:  # parabolic
                 params_layout.addRow("Flatness:", self.param_widgets['flatness'])
+
+        elif self.filter_type == 'plateau':
+            self.param_widgets['center_freq'] = ParameterControl(20.0, 20000.0, self.params.get('center_freq', 1000.0), 0, " Hz")
+            self.param_widgets['width'] = ParameterControl(1.0, 10000.0, self.params.get('width', 100.0), 0, " Hz")  # Increased max to 10kHz
+            self.param_widgets['flat_width'] = ParameterControl(1.0, 10000.0, self.params.get('flat_width', 50.0), 0, " Hz")  # Also increase flat width max
+            self.param_widgets['gain_db'] = ParameterControl(-120.0, 0.0, self.params.get('gain_db', 0.0), 1, " dB", 0.1)
+            
+            params_layout.addRow("Center:", self.param_widgets['center_freq'])
+            params_layout.addRow("Total Width:", self.param_widgets['width'])
+            params_layout.addRow("Flat Width:", self.param_widgets['flat_width'])
+            params_layout.addRow("Gain:", self.param_widgets['gain_db'])
 
         # Add params_layout to main layout
         layout.addLayout(params_layout)
@@ -953,23 +1438,27 @@ class FilterPanel(QGroupBox):
     filter_removed = pyqtSignal(int)
     filter_parameters = pyqtSignal(dict)
 
-    def __init__(self, config: AudioConfig, processor=None):  # Add processor parameter
+    def __init__(self, config: AudioConfig, processor=None):
         super().__init__("Filters")
         self.config = config
-        self.processor = processor  # Store processor reference
-        self.filters = []
+        self.processor = processor
+        self.filters = []  # Initialize the filters list
         self.init_ui()
+        # Set size policy to maintain consistent sizing
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.setMinimumHeight(100)  # Set reasonable minimum height
 
     def init_ui(self):
-        # Use QVBoxLayout for the main panel
         main_layout = QVBoxLayout(self)
-        self.setLayout(main_layout)
-
+        main_layout.setSpacing(4)  # Increased spacing
+        main_layout.setContentsMargins(6, 8, 6, 8)  # Increased margins
+        
         # Replace button layout with combo box and single add button
         add_layout = QHBoxLayout()
+        add_layout.setSpacing(4)  # Increased spacing
         
         self.filter_type = QComboBox()
-        self.filter_type.addItems(["Lowpass", "Highpass", "Bandpass", "Notch", "Gaussian", "Parabolic"])  # Added Parabolic
+        self.filter_type.addItems(["Plateau", "Parabolic", "Gaussian", "Bandpass", "Lowpass", "Highpass", "Notch"])
         add_layout.addWidget(self.filter_type, stretch=1)
         
         add_btn = QPushButton("Add")
@@ -987,8 +1476,8 @@ class FilterPanel(QGroupBox):
         # Create container widget for filters
         self.filter_container = QWidget()
         self.filter_layout = QVBoxLayout(self.filter_container)
-        self.filter_layout.setSpacing(4)  # Reduce space between filters
-        self.filter_layout.setContentsMargins(4, 4, 4, 4)  # Reduce margins
+        self.filter_layout.setSpacing(4)  # Increased spacing between filters
+        self.filter_layout.setContentsMargins(4, 4, 4, 4)  # Increased margins
         self.filter_layout.addStretch()  # Push filters to top
         
         # Add container to scroll area
@@ -1005,7 +1494,8 @@ class FilterPanel(QGroupBox):
             'bandpass': {'type': 'bandpass', 'lowcut': 100, 'highcut': 1000},
             'notch': {'type': 'notch', 'freq': 1000, 'q': 30.0},
             'gaussian': {'type': 'gaussian', 'center_freq': 1000, 'width': 100, 'amplitude': 1.0},
-            'parabolic': {'type': 'parabolic', 'center_freq': 1000, 'width': 100, 'amplitude': 1.0}
+            'parabolic': {'type': 'parabolic', 'center_freq': 1000, 'width': 100, 'amplitude': 1.0},
+            'plateau': {'type': 'plateau', 'center_freq': 10000, 'width': 5000, 'flat_width': 2000, 'amplitude': 0.5}
         }
 
         params = default_params[filter_type]
@@ -1044,11 +1534,14 @@ class FilterPanel(QGroupBox):
         }
 
     def apply_settings(self, settings: Dict[str, Any]):
-        # Clear existing filters
+        """Update UI to reflect loaded filter settings without managing filters"""
+        # Clear existing filter widgets
         while self.filters:
-            self.remove_filter(0)
+            widget = self.filters.pop(0)
+            self.filter_layout.removeWidget(widget)
+            widget.deleteLater()
             
-        # Add filters from settings
+        # Add filter widgets from settings
         for filter_params in settings.get('filters', []):
             filter_type = filter_params['type']
             widget = FilterWidget(filter_type, filter_params)
@@ -1058,6 +1551,8 @@ class FilterPanel(QGroupBox):
                 lambda idx=len(self.filters): self.remove_filter(idx))
             self.filter_layout.insertWidget(len(self.filters), widget)
             self.filters.append(widget)
+            
+        logger.debug(f"DEBUG: FilterPanel apply_settings - created {len(self.filters)} filter widgets")
 
 class ParabolaWidget(QFrame):
     """Individual parabola control widget"""
@@ -1111,26 +1606,29 @@ class ParabolaWidget(QFrame):
     def get_parameters(self) -> dict:
         return self.params
 
-class SpectralComponentsPanel(QGroupBox):  # Renamed from ParabolaPanel
+class SpectralComponentsPanel(QGroupBox):
     parabola_updated = pyqtSignal(int, dict)
     parabola_removed = pyqtSignal(int)
     parabola_added = pyqtSignal(dict)
 
-    def __init__(self, processor=None):  # Add processor parameter
+    def __init__(self, processor=None):
         super().__init__("Spectral Components")
-        self.processor = processor  # Store processor reference
+        self.processor = processor
         self.parabolas = []
         self.init_ui()
+        # Set size policy to maintain consistent sizing
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.setMinimumHeight(100)  # Set reasonable minimum height
 
     def init_ui(self):
-        # Use QVBoxLayout for the main panel
         main_layout = QVBoxLayout(self)
-        self.setLayout(main_layout)
+        main_layout.setSpacing(4)  # Increased spacing
+        main_layout.setContentsMargins(6, 8, 6, 8)  # Increased margins
 
         # Add button
         add_btn = QPushButton("Add Component")
         main_layout.addWidget(add_btn)
-        add_btn.clicked.connect(self.add_parabola)
+        add_btn.clicked.connect(lambda: self.add_parabola())
 
         # Create scroll area
         scroll = QScrollArea()
@@ -1141,8 +1639,8 @@ class SpectralComponentsPanel(QGroupBox):  # Renamed from ParabolaPanel
         # Create container widget for components
         self.parabola_container = QWidget()
         self.parabola_layout = QVBoxLayout(self.parabola_container)
-        self.parabola_layout.setSpacing(4)
-        self.parabola_layout.setContentsMargins(4, 4, 4, 4)
+        self.parabola_layout.setSpacing(4)  # Increased spacing
+        self.parabola_layout.setContentsMargins(4, 4, 4, 4)  # Increased margins
         self.parabola_layout.addStretch()
         
         # Add container to scroll area
@@ -1151,15 +1649,29 @@ class SpectralComponentsPanel(QGroupBox):  # Renamed from ParabolaPanel
         # Add scroll area to main layout, with stretch
         main_layout.addWidget(scroll, stretch=1)
 
-    def add_parabola(self):
-        params = {
-            'id': len(self.parabolas) + 1,
-            'center_freq': 1000.0,
-            'width': 100.0,
-            'amplitude': 0.5,
-            'slope': 1.0,
-            'phase': 0.0
-        }
+    def add_parabola(self, params=None):
+        """Add a new parabola component. If params is provided, use those values."""
+        # Create default parameters if none provided or if called from button click
+        if params is None or isinstance(params, bool):
+            params = {
+                'id': len(self.parabolas) + 1,
+                'center_freq': 1000.0,
+                'width': 100.0,
+                'amplitude': 0.5,
+                'slope': 1.0,
+                'phase': 0.0
+            }
+        else:
+            # Ensure ID is set when loading from settings
+            if 'id' not in params:
+                params['id'] = len(self.parabolas) + 1
+            # Ensure required parameters have defaults
+            params.setdefault('center_freq', 1000.0)
+            params.setdefault('width', 100.0)
+            params.setdefault('amplitude', 0.5)
+            params.setdefault('slope', 1.0)
+            params.setdefault('phase', 0.0)
+
         widget = ParabolaWidget(params)
         widget.parameterChanged.connect(
             lambda p, idx=len(self.parabolas): self.parabola_updated.emit(idx, p))
@@ -1201,214 +1713,108 @@ class CppTemplate:
         self.after = after
         self.var_name = var_name
         self.length_name = length_name
-
+        
     @classmethod
     def get_default_templates(cls) -> List['CppTemplate']:
         # Header file template (.h)
         header_template = cls(
             name="Header File",
-            before="""
-// Auto-generated audio data header
-#pragma once
-
-#define {length_name} {length}  // Array length
-
-// Audio samples normalized to int16 (-32768 to 32767)
-extern const int16_t {var_name}[{length_name}];
-""",
-            after="",
-            var_name="audioData",
-            length_name="AUDIO_LENGTH"
+            before="// Auto-generated audio data header\n\n",
+            after="#define SAMPLE_RATE 44100\n"
+                "#define @{length_name} @{length}  // Array length\n\n"
+                 "// Audio samples normalized to int16 (-32768 to 32767)\n"
+                 "int16_t @{var_name}[@{length_name}] = {\n"
+                 "@{array_data}\n"
+                 "};\n"
         )
-
-        # Source file template with Arduino example (.cpp)
-        source_template = cls(
-            name="Arduino Source",
-            before="""
-// Auto-generated audio source file
-#include "{filename}.h"
-
-/* Example usage:
-class AudioPlayer {
-    int currentIndex = 0;
-public:
-    int16_t getNextSample() {
-        if (currentIndex >= {length_name}) currentIndex = 0;
-        return {var_name}[currentIndex++];
-    }
-};
-*/
-
-// Audio samples array
-const int16_t {var_name}[{length_name}] = {""",
-            after="""};
-""",
-            var_name="audioData",
-            length_name="AUDIO_LENGTH"
-        )
-
-        return [header_template, source_template]
+        
+        return [header_template]
 
 class ExportDialog(QDialog):
-    def __init__(self, parent=None, mode="White Noise"):  # Add mode parameter
+    def __init__(self, parent=None, mode="White Noise"):
         super().__init__(parent)
-        self.setWindowTitle(f"Export {mode}")  # Update title with mode
-        self.setModal(True)
-        self.folder_path = None
-        # Initialize cpp_template with default values
-        self.cpp_template = {
-            'template_text': (
-                "// Auto-generated audio data header\n"
-                "#pragma once\n\n"
-                "#define {length_name} {length}  // Array length\n\n"
-                "// Audio samples normalized to int16 (-32768 to 32767)\n"
-                "const int16_t {var_name}[{length_name}] = {{\n"
-                "{array_data}\n"
-                "}};\n"
-            ),
+        self.setWindowTitle("Export Audio")
+        self.mode = mode
+        self.folder_path = None  # Initialize folder_path
+        
+        # Get templates from parent
+        parent_cpp = getattr(self.parent(), 'cpp_template', None)
+        parent_carousel = getattr(self.parent(), 'carousel_template', None)
+        
+        logger.debug("ExportDialog init - Parent templates:")
+        logger.debug("Parent cpp_template: %s", parent_cpp)
+        logger.debug("Parent carousel_template: %s", parent_carousel)
+        
+        # Initialize templates with defaults if parent templates are None
+        default_cpp_template = {
+            'template_text': '// Auto-generated audio data header\n\n#define SAMPLE_RATE 44100\n#define @{length_name} @{length}  // Array length\n\n// Audio samples normalized to int16 (-32768 to 32767)\nint16_t @{var_name}[@{length_name}] = {\n@{array_data}\n};\n',
             'var_name': 'audioData',
             'length_name': 'AUDIO_LENGTH'
         }
-        self.mode = mode  # Store mode
         
-        # Get saved settings from parent if available
-        if hasattr(parent, 'export_settings'):
-            self.saved_settings = parent.export_settings
-        else:
-            self.saved_settings = {}
-            
-        # Get appropriate amplitude based on mode
-        parent_amplitude = 0.5  # Default fallback
-        if hasattr(parent, 'amplitude_control'):
-            if mode == "White Noise":
-                parent_amplitude = parent.config.amp_whitenoise
-            elif mode == "Spectral Synthesis":
-                parent_amplitude = parent.config.amp_spectral
-            
-        # Initialize export settings dict if not already populated
-        if not self.saved_settings:
-            self.saved_settings = {
-                'amplitude': parent_amplitude,
-                'attenuation': 0,
-                'enable_attenuation': False
-            }
-
-        # Initialize UI elements
+        default_carousel_template = {
+            'template_text': '#define SAMPLE_RATE 44100\n#define NUM_BUFFERS @{num_buffers}\n#define MONO_SAMPLES @{samples_per_buffer}  // Samples per buffer\n#define STEREO_SAMPLES (MONO_SAMPLES * 2)\n#define SILENCE_SAMPLES @{silence_samples}\n\n// Noise samples for carousel playback\n// Generated with @{generator_type}\n\nint16_t @{buffer_name}[@{samples_per_buffer}] = {@{data}};\n\nint16_t @{silence_buffer_name}[SILENCE_SAMPLES] = {@{silence_data}};\nint16_t* @{buffer_array_name}[NUM_BUFFERS] = {@{buffer_list}};\nint currentBufferIndex = 0;\n',
+            'buffer_name_format': 'buffer@{index+1}',
+            'buffer_array_name': 'noiseBuffers',
+            'silence_buffer_name': 'silenceBuffer'
+        }
+        
+        self.cpp_template = parent_cpp.copy() if parent_cpp is not None else default_cpp_template.copy()
+        self.carousel_template = parent_carousel.copy() if parent_carousel is not None else default_carousel_template.copy()
+        
+        # Initialize export settings with templates
+        self.export_settings = {
+            'cpp_template': self.cpp_template,
+            'carousel_template': self.carousel_template
+        }
+        
+        logger.debug("ExportDialog init - Initialized templates:")
+        logger.debug("Initial cpp_template: %s", self.cpp_template)
+        logger.debug("Initial carousel_template: %s", self.carousel_template)
+        
+        self.filter_settings = []  # Initialize filter_settings
         self.init_ui()
 
-        # Initialize cpp_template from parent if available
-        if hasattr(parent, 'cpp_template'):
-            self.cpp_template = parent.cpp_template.copy()
-        else:
-            self.cpp_template = {
-                'template_text': "// Default template\n",
-                'var_name': 'audioData',
-                'length_name': 'AUDIO_LENGTH'
-            }
-
-    def apply_saved_settings(self, settings):
-        """Apply previously saved settings to dialog controls"""
-        try:
-            if not settings:
-                return
-                
-            # Duration
-            if 'duration' in settings:
-                self.duration.setValue(settings['duration'])
-                
-            # Amplitude/Attenuation - handle zero amplitude case
-            if 'amplitude' in settings:
-                amplitude = settings['amplitude']
-                if amplitude > 0:  # Only calculate attenuation for non-zero amplitude
-                    attn_db = -20 * np.log10(amplitude)
-                    self.enable_attenuation.setChecked(attn_db > 0)
-                    if attn_db > 0:
-                        self.attenuation.setValue(int(min(attn_db, 96)))  # Clamp to max 96 dB
-                else:
-                    # For zero amplitude, set max attenuation
-                    self.enable_attenuation.setChecked(True)
-                    self.attenuation.setValue(96)  # Set to maximum allowed attenuation
-                    
-            # Fade settings
-            if 'fade_in_duration' in settings:
-                self.fade_in.setValue(settings['fade_in_duration'] * 1000.0)  # Convert to ms
-            if 'fade_out_duration' in settings:
-                self.fade_out.setValue(settings['fade_out_duration'] * 1000.0)  # Convert to ms
-            if 'fade_in_power' in settings:
-                self.fade_in_power.setValue(settings['fade_in_power'])
-            if 'fade_out_power' in settings:
-                self.fade_out_power.setValue(settings['fade_out_power'])
-            if 'enable_fade' in settings:
-                self.enable_fade_in.setChecked(settings['enable_fade'])
-                self.enable_fade_out.setChecked(settings['enable_fade'])
-                
-            # Normalization
-            if 'enable_normalization' in settings:
-                self.enable_normalization.setChecked(settings['enable_normalization'])
-            if 'normalize_value' in settings:
-                self.normalize_value.setValue(settings['normalize_value'])
-                
-            # File settings
-            if 'folder_path' in settings:
-                self.folder_path = settings['folder_path']
-                self.folder_path_label.setText(settings['folder_path'])
-            if 'wav_filename' in settings:
-                self.wav_filename.setText(settings['wav_filename'])
-            if 'cpp_filename' in settings:
-                self.cpp_filename.setText(settings['cpp_filename'])
-            
-            # Export options
-            if 'export_wav' in settings:
-                self.export_wav.setChecked(settings['export_wav'])
-            if 'export_cpp' in settings:
-                self.export_cpp.setChecked(settings['export_cpp'])
-                
-            # Seed settings
-            if 'use_random_seed' in settings:
-                self.use_random_seed.setChecked(settings['use_random_seed'])
-            if 'seed' in settings and settings['seed'] is not None:
-                self.seed_input.setValue(settings['seed'])
-                
-        except Exception as e:
-            print(f"Error applying saved settings: {e}")
-
     def init_ui(self):
-        layout = QFormLayout(self)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)  # Increased spacing between groups
+        layout.setContentsMargins(8, 10, 8, 10)  # Increased margins
 
-        # Export options group
-        options_group = QGroupBox(f"{self.mode} Export Options")  # Update group title
-        options_layout = QFormLayout(options_group)
+        # Source Settings group
+        source_group = QGroupBox("Source Settings")
+        source_layout = QFormLayout()
+        source_layout.setSpacing(4)  # Increased spacing
+        source_layout.setContentsMargins(6, 8, 6, 8)  # Increased margins
+        source_layout.setHorizontalSpacing(8)  # Space between labels and fields
+        source_layout.setVerticalSpacing(4)  # Space between rows
 
         # Duration control
         self.duration = QDoubleSpinBox()
-        self.duration.setRange(0.1, 3600.0)
+        self.duration.setRange(1.0, 3600.0)  # Changed minimum from 0.1 to 1.0
         self.duration.setValue(10.0)
         self.duration.setSuffix(" milliseconds")
-        options_layout.addRow("Duration:", self.duration)
+        source_layout.addRow("Duration:", self.duration)
 
-        # Add base amplitude control - Updated to load from parent
+        # Base amplitude (moved here from post process)
         self.amplitude = QDoubleSpinBox()
         self.amplitude.setRange(0.0, 1.0)
-        self.amplitude.setValue(self.parent().amplitude_control.value() if hasattr(self.parent(), 'amplitude_control') else 0.5)  # Get from parent
+        self.amplitude.setValue(self.parent().amplitude_control.value() if hasattr(self.parent(), 'amplitude_control') else 0.5)
         self.amplitude.setSingleStep(0.1)
         self.amplitude.setDecimals(2)
         self.amplitude.setSuffix("x")
-        options_layout.addRow("Base Amplitude:", self.amplitude)
+        source_layout.addRow("Base Amplitude:", self.amplitude)
 
-        # Add seed control group after duration
-        seed_group = QGroupBox("Random Seed")
-        seed_layout = QHBoxLayout(seed_group)
-        
+        # RNG Settings
+        seed_layout = QHBoxLayout()
         self.use_random_seed = QCheckBox("Random Seed")
         self.use_random_seed.setChecked(True)
         self.use_random_seed.toggled.connect(self.toggle_seed_input)
         
         self.seed_input = QSpinBox()
         self.seed_input.setRange(0, 999999999)
-        self.seed_input.setValue(12345)  # Default seed
+        self.seed_input.setValue(12345)
         self.seed_input.setEnabled(False)
         
-        # Regenerate button to get a new random seed
         self.regen_seed = QPushButton("New Seed")
         self.regen_seed.clicked.connect(self.generate_random_seed)
         self.regen_seed.setEnabled(False)
@@ -1416,152 +1822,212 @@ class ExportDialog(QDialog):
         seed_layout.addWidget(self.use_random_seed)
         seed_layout.addWidget(self.seed_input)
         seed_layout.addWidget(self.regen_seed)
-        options_layout.addRow(seed_group)
+        source_layout.addRow(seed_layout)
+        
+        # Set the layout for source group
+        source_group.setLayout(source_layout)
+        layout.addWidget(source_group)  # Add to main layout
 
-        # Fade controls group moved after seed
+        # 2. Processing Settings group
+        process_group = QGroupBox("Processing Settings")
+        process_layout = QFormLayout(process_group)
+        
+        # Processing order selection with clearer names
+        self.process_order = QComboBox()
+        # Add items in order matching config default (True = "Fade then Normalize")
+        self.process_order.addItems([
+            "Fade then Normalize",
+            "Normalize then Fade"
+        ])
+        process_layout.addRow("Process Order:", self.process_order)
+
+        # Normalization settings
+        self.enable_normalization = QCheckBox("Enable Normalization")
+        self.enable_normalization.setChecked(self.parent().config.enable_normalization)
+        self.enable_normalization.stateChanged.connect(self._update_normalization_controls)
+        # Also connect to carousel normalization
+        self.enable_normalization.stateChanged.connect(self._update_carousel_normalization)
+        self.normalize_value = QDoubleSpinBox()
+        self.normalize_value.setRange(0.0, 2.0)
+        self.normalize_value.setValue(self.parent().config.normalize_value)
+        self.normalize_value.setSingleStep(0.1)
+        self.normalize_value.setDecimals(2)
+        self.normalize_value.setSuffix("x")
+        norm_layout = QHBoxLayout()
+        norm_layout.addWidget(self.enable_normalization)
+        norm_layout.addWidget(self.normalize_value)
+        process_layout.addRow("Normalization:", norm_layout)
+
+        # Connect normalization checkbox to control global normalization
+        self.enable_normalization.toggled.connect(self._update_normalization_controls)
+
+        # Fade settings
         fade_group = QGroupBox("Fade Settings")
-        fade_layout = QHBoxLayout(fade_group)
+        fade_layout = QGridLayout()
         
-        # Fade in controls (left side)
-        fade_in_group = QGroupBox("Fade In")
-        fade_in_layout = QFormLayout()
-        
-        self.enable_fade_in = QCheckBox("Enable")
-        self.enable_fade_in.setChecked(True)
-        fade_in_layout.addRow(self.enable_fade_in)
-        
+        self.enable_fade_in = QCheckBox("Fade In")
+        self.enable_fade_in.setChecked(True)  # Set checked by default
         self.fade_in = QDoubleSpinBox()
         self.fade_in.setRange(0.1, 1000.0)
         self.fade_in.setValue(1.0)
         self.fade_in.setSuffix(" ms")
-        self.fade_in.setEnabled(True)
-        fade_in_layout.addRow("Duration:", self.fade_in)
-        
         self.fade_in_power = QDoubleSpinBox()
-        self.fade_in_power.setRange(0.1, 5.0)  # Increased max value
+        self.fade_in_power.setRange(0.1, 5.0)
         self.fade_in_power.setValue(2.0)
-        self.fade_in_power.setSingleStep(0.1)
-        self.fade_in_power.setEnabled(True)
-        fade_in_layout.addRow("Power:", self.fade_in_power)
+        self.fade_in_power.setSuffix("x")
         
-        fade_in_group.setLayout(fade_in_layout)
-        fade_layout.addWidget(fade_in_group)
-        
-        # Fade out controls (right side)
-        fade_out_group = QGroupBox("Fade Out")
-        fade_out_layout = QFormLayout()
-        
-        self.enable_fade_out = QCheckBox("Enable")
-        self.enable_fade_out.setChecked(True)
-        fade_out_layout.addRow(self.enable_fade_out)
-        
+        self.enable_fade_out = QCheckBox("Fade Out")
+        self.enable_fade_out.setChecked(True)  # Set checked by default
         self.fade_out = QDoubleSpinBox()
         self.fade_out.setRange(0.1, 1000.0)
         self.fade_out.setValue(1.0)
         self.fade_out.setSuffix(" ms")
-        self.fade_out.setEnabled(True)
-        fade_out_layout.addRow("Duration:", self.fade_out)
-        
         self.fade_out_power = QDoubleSpinBox()
-        self.fade_out_power.setRange(0.1, 5.0)  # Increased max value
+        self.fade_out_power.setRange(0.1, 5.0)
         self.fade_out_power.setValue(2.0)
-        self.fade_out_power.setSingleStep(0.1)
-        self.fade_out_power.setEnabled(True)
-        fade_out_layout.addRow("Power:", self.fade_out_power)
-        
-        fade_out_group.setLayout(fade_out_layout)
-        fade_layout.addWidget(fade_out_group)
-        
-        # Connect enable checkboxes
-        self.enable_fade_in.toggled.connect(lambda e: self._update_fade_controls('in', e))
-        self.enable_fade_out.toggled.connect(lambda e: self._update_fade_controls('out', e))
-        
-        options_layout.addRow(fade_group)
+        self.fade_out_power.setSuffix("x")
 
-        # Normalization and attenuation
-        norm_layout = QHBoxLayout()
-        
-        # Normalization checkbox and value
-        self.enable_normalization = QCheckBox("Enable Normalization")
-        self.enable_normalization.setChecked(True)
-        norm_layout.addWidget(self.enable_normalization)
-        
-        self.normalize_value = QDoubleSpinBox()
-        self.normalize_value.setRange(0.0, 2.0)
-        self.normalize_value.setValue(1.0)
-        self.normalize_value.setSingleStep(0.1)
-        self.normalize_value.setDecimals(2)
-        self.normalize_value.setEnabled(True)
-        norm_layout.addWidget(self.normalize_value)
-        
-        options_layout.addRow(norm_layout)
+        # Grid layout for fade controls
+        fade_layout.addWidget(self.enable_fade_in, 0, 0)
+        fade_layout.addWidget(self.fade_in, 0, 1)
+        fade_layout.addWidget(self.fade_in_power, 0, 2)
+        fade_layout.addWidget(self.enable_fade_out, 1, 0)
+        fade_layout.addWidget(self.fade_out, 1, 1)
+        fade_layout.addWidget(self.fade_out_power, 1, 2)
+        fade_group.setLayout(fade_layout)
+        process_layout.addRow(fade_group)
+        layout.addWidget(process_group)  # Add to main layout using addWidget
 
+        # 3. Post Processing group
+        post_group = QGroupBox("Post Processing")
+        post_layout = QFormLayout(post_group)
+
+        # Attenuation
         attn_layout = QHBoxLayout()
         self.enable_attenuation = QCheckBox("Additional Attenuation")
-        self.enable_attenuation.setChecked(False)
-        attn_layout.addWidget(self.enable_attenuation)
-        
+        self.enable_attenuation.setChecked(False)  # Explicitly set to unchecked by default
         self.attenuation = QSpinBox()
         self.attenuation.setRange(0, 96)
-        self.attenuation.setValue(12)
+        self.attenuation.setValue(12)  # Set default value to 12 dB
         self.attenuation.setSuffix(" dB")
-        self.attenuation.setEnabled(False)
+        self.attenuation.setEnabled(False)  # Explicitly disable by default
         self.enable_attenuation.toggled.connect(self.attenuation.setEnabled)
+        attn_layout.addWidget(self.enable_attenuation)
         attn_layout.addWidget(self.attenuation)
-        options_layout.addRow(attn_layout)
-        
-        layout.addRow(options_group)
+        post_layout.addRow(attn_layout)
+        layout.addWidget(post_group)  # Add to main layout using addWidget
 
-        # File settings group
-        file_group = QGroupBox("Output Files")
-        file_layout = QFormLayout(file_group)
+        # 4. Output Settings group
+        output_group = QGroupBox("Output Settings")
+        output_layout = QFormLayout(output_group)
 
-        # Folder path with browse button
+        # File path controls
         folder_layout = QHBoxLayout()
         self.folder_path_label = QLabel("None")
-        folder_layout.addWidget(self.folder_path_label, stretch=1)
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self.browse_folder)
+        folder_layout.addWidget(self.folder_path_label, stretch=1)
         folder_layout.addWidget(browse_btn)
-        file_layout.addRow("Output Folder:", folder_layout)
+        output_layout.addRow("Folder:", folder_layout)
 
-        # WAV file settings
+        # WAV output
         wav_layout = QHBoxLayout()
         self.wav_filename = QLineEdit("noise.wav")
-        wav_layout.addWidget(self.wav_filename, stretch=1)
         self.export_wav = QCheckBox("Export WAV")
         self.export_wav.setChecked(True)
-        self.export_wav.toggled.connect(self.validate_export_options)
+        wav_layout.addWidget(self.wav_filename, stretch=1)
         wav_layout.addWidget(self.export_wav)
-        file_layout.addRow("WAV Filename:", wav_layout)
+        output_layout.addRow("WAV:", wav_layout)
+        # Connect WAV export state changes
+        self.export_wav.stateChanged.connect(self._update_wav_export_options)
 
-        # CPP file settings
+        # C++ output
         cpp_layout = QHBoxLayout()
-        self.cpp_filename = QLineEdit("noise.h")  # Changed default to .h
+        self.cpp_filename = QLineEdit("noise.h")
+        self.export_cpp = QCheckBox("Export C++")
+        self.export_cpp.setChecked(True)  # Set checked by default
         cpp_layout.addWidget(self.cpp_filename, stretch=1)
-        
-        self.export_cpp = QCheckBox("Export C++/H")  # Updated label
-        self.export_cpp.setChecked(True)
-        self.export_cpp.toggled.connect(self.validate_export_options)
-        
-        template_btn = QPushButton("Template...")
-        template_btn.clicked.connect(self.edit_template)
-        
-        cpp_layout.addWidget(self.cpp_filename)
-        cpp_layout.addWidget(template_btn)
         cpp_layout.addWidget(self.export_cpp)
-        file_layout.addRow("C++ Filename:", cpp_layout)
+        output_layout.addRow("C++:", cpp_layout)
 
-        layout.addRow(file_group)
+        # Create tabs for template modes
+        self.mode_tabs = QTabWidget()
+        
+        # Create both tabs first
+        carousel_tab = QWidget()
+        carousel_layout = QFormLayout(carousel_tab)
+        
+        single_tab = QWidget()
+        single_layout = QFormLayout(single_tab)
 
-        # Buttons
+        # Add carousel tab FIRST with all its content
+        self.num_samples = QSpinBox()
+        self.num_samples.setRange(1, 100)
+        self.num_samples.setValue(20)
+        carousel_layout.addRow("Number of Samples:", self.num_samples)
+
+        # Silence duration
+        self.silence_duration = QDoubleSpinBox()
+        self.silence_duration.setRange(0.0, 1000.0)
+        self.silence_duration.setValue(190.0)
+        self.silence_duration.setSuffix(" ms")
+        carousel_layout.addRow("Silence Duration:", self.silence_duration)
+
+        # Add global normalization here instead
+        self.global_norm = QCheckBox("Use Global Normalization")
+        self.global_norm.setToolTip(
+            "Global: Normalize across all samples\n"
+            "Per-sample: Normalize each sample individually"
+        )
+        self.global_norm.setChecked(self.parent().config.enable_normalization)  # Use config value
+        # Initially disabled if normalization is not enabled
+        self.global_norm.setEnabled(self.enable_normalization.isChecked())
+        carousel_layout.addRow("", self.global_norm)
+
+        # Add template button for carousel mode
+        template_btn = QPushButton("Edit Carousel Template...")
+        template_btn.clicked.connect(lambda: self.edit_template(True))  # Pass True for carousel mode
+        carousel_layout.addRow(template_btn)
+
+        # Export options
+        export_group = QGroupBox("WAV Export Format")  # Changed group title
+        export_options = QVBoxLayout()
+        self.export_combined = QCheckBox("Export Combined Sequence WAV")  # Updated label
+        self.export_individual = QCheckBox("Export Individual WAV Files")  # Updated label
+        self.export_combined.setChecked(True)
+        export_options.addWidget(self.export_combined)
+        export_options.addWidget(self.export_individual)
+        export_group.setLayout(export_options)
+        carousel_layout.addRow(export_group)
+
+        # Initial state update for WAV export options
+        self._update_wav_export_options(Qt.CheckState.Checked if self.export_wav.isChecked() else Qt.CheckState.Unchecked)
+
+        self.mode_tabs.addTab(carousel_tab, "Carousel Mode")
+        
+        # Add content to single file tab
+        single_tab = QWidget()
+        single_layout = QFormLayout(single_tab)
+        cpp_template_btn = QPushButton("Edit C++ Template...")
+        cpp_template_btn.clicked.connect(lambda: self.edit_template(False))  # Pass False for single file mode
+        single_layout.addRow(cpp_template_btn)
+        single_tab.setLayout(single_layout)
+        self.mode_tabs.addTab(single_tab, "Single File")
+
+        # Set Carousel tab as default
+        self.mode_tabs.setCurrentIndex(0)
+
+        output_layout.addWidget(self.mode_tabs)
+        layout.addWidget(output_group)
+
+        # Final buttons
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | 
             QDialogButtonBox.StandardButton.Cancel
         )
         self.button_box.accepted.connect(self.validate_and_accept)
         self.button_box.rejected.connect(self.reject)
-        layout.addRow(self.button_box)
+        layout.addWidget(self.button_box)  # Add to main layout using addWidget
 
         # Initial validation
         self.validate_export_options()
@@ -1634,71 +2100,302 @@ class ExportDialog(QDialog):
 
     def get_settings(self) -> dict:
         """Get export settings with fixed sample rate and calculated amplitude"""
-        # Ensure proper file extensions before getting settings
+        try:
+            logger.debug("Starting get_settings")
+            self._ensure_file_extensions()
+            basic_settings = self._get_basic_settings()
+            logger.debug("Got basic settings: %s", basic_settings)
+            
+            file_settings = self._get_file_settings()
+            logger.debug("Got file settings: %s", file_settings)
+            
+            carousel_settings = self._get_carousel_settings()
+            logger.debug("Got carousel settings: %s", carousel_settings)
+            
+            filter_settings = self._get_filter_settings()
+            logger.debug("Got filter settings: %s", filter_settings)
+            
+            settings = {
+                **basic_settings,
+                **file_settings,
+                **carousel_settings,
+                'filters': filter_settings,
+                'source_type': self.mode
+            }
+            logger.debug("Returning combined settings: %s", settings)
+            return settings
+        except Exception as e:
+            logger.error("Error in get_settings: %s", e, exc_info=True)
+            raise
+
+    def _ensure_file_extensions(self):
+        """Ensure proper file extensions for export files"""
         if self.export_wav.isChecked() and not self.wav_filename.text().lower().endswith('.wav'):
             self.wav_filename.setText(self.wav_filename.text() + '.wav')
-
         if self.export_cpp.isChecked() and not self.cpp_filename.text().lower().endswith(('.cpp', '.h')):
             self.cpp_filename.setText(self.cpp_filename.text() + '.h')
 
-        # Convert attenuation in dB to amplitude multiplier only if enabled
-        base_amplitude = self.amplitude.value()  # Get base amplitude
+    def _get_basic_settings(self) -> dict:
+        """Get basic export settings including amplitude and processing"""
+        base_amplitude = self.amplitude.value()
         try:
             if self.enable_attenuation.isChecked():
                 attn_db = self.attenuation.value()
                 final_amplitude = base_amplitude * (10 ** (-attn_db / 20))
-                # Ensure we don't get values too close to zero
-                final_amplitude = max(final_amplitude, 1e-10)
+                final_amplitude = max(final_amplitude, 1e-10)  # Ensure non-zero
             else:
                 final_amplitude = base_amplitude
         except Exception as e:
-            print(f"Error calculating amplitude: {e}")
-            final_amplitude = 1e-10  # Provide safe fallback value
+            logger.error(f"Error calculating amplitude: {e}")
+            final_amplitude = 1e-10  # Safe fallback
 
-        # Use cpp_filename for both header and source if cpp export is enabled
-        cpp_name = self.cpp_filename.text()
-        base_name = os.path.splitext(cpp_name)[0]  # Remove extension
-        
-        settings = {
-            'duration': self.duration.value(),
+        return {
+            'duration': self.duration.value() / 1000.0,  # Convert ms to seconds
             'sample_rate': 44100,
-            'base_amplitude': base_amplitude,  # Add base amplitude to settings
-            'amplitude': final_amplitude,  # Final amplitude after attenuation
+            'base_amplitude': base_amplitude,
+            'amplitude': final_amplitude,
+            'attenuation': self.attenuation.value(),
+            'enable_attenuation': self.enable_attenuation.isChecked(),
             'export_wav': self.export_wav.isChecked(),
             'export_cpp': self.export_cpp.isChecked(),
-            'enable_fade': self.enable_fade_in.isChecked() or self.enable_fade_out.isChecked(),
+            'enable_fade_in': self.enable_fade_in.isChecked(),
+            'enable_fade_out': self.enable_fade_out.isChecked(),
+            'enable_fade': self.enable_fade_in.isChecked() or self.enable_fade_out.isChecked(),  # Backward compatibility
             'fade_in_duration': self.fade_in.value() / 1000.0 if self.enable_fade_in.isChecked() else 0,
             'fade_out_duration': self.fade_out.value() / 1000.0 if self.enable_fade_out.isChecked() else 0,
             'fade_in_power': self.fade_in_power.value(),
             'fade_out_power': self.fade_out_power.value(),
             'enable_normalization': self.enable_normalization.isChecked(),
             'normalize_value': self.normalize_value.value(),
+            'fade_before_norm': self.process_order.currentText() == "Fade then Normalize",
+            'use_random_seed': self.use_random_seed.isChecked(),
+            'seed': self.seed_input.value() if not self.use_random_seed.isChecked() else None,
+            'rng_type': self.parent().rng_type.currentText().lower().replace(' ', '_')
+        }
+
+    def _get_file_settings(self) -> dict:
+        """Get file-related settings including paths and templates"""
+        cpp_name = self.cpp_filename.text()
+        base_name = os.path.splitext(cpp_name)[0]
+        return {
             'folder_path': self.folder_path,
             'wav_filename': self.wav_filename.text(),
-            'header_filename': base_name + '.h',  # Force .h extension for header
-            'source_filename': base_name + '.cpp', # Force .cpp extension for source
+            'cpp_filename': self.cpp_filename.text(),
+            'header_filename': base_name + '.h',
             'cpp_template': self.cpp_template,
-            'use_random_seed': self.use_random_seed.isChecked(),
-            'seed': None if self.use_random_seed.isChecked() else self.seed_input.value()
+            'carousel_template': self.carousel_template
         }
-        return settings
 
-    def edit_template(self):
-        """Open template editor dialog"""
-        dialog = CppTemplateDialog(self.cpp_template, self)
-        # Connect template change signal
-        dialog.template_changed.connect(self.on_template_changed)
-        dialog.exec()
+    def _get_filter_settings(self) -> list:
+        """Get current filter settings from parent's filter panel"""
+        if hasattr(self.parent(), 'filter_panel'):
+            self.filter_settings = self.parent().filter_panel.get_current_settings().get('filters', [])
+        return self.filter_settings
 
-    def on_template_changed(self, template: dict):
-        """Handle template changes"""
+    def _get_carousel_settings(self) -> dict:
+        """Get carousel-specific settings"""
+        is_carousel_tab = self.mode_tabs.currentIndex() == 0
+        return {
+            'carousel_enabled': is_carousel_tab,
+            'carousel_samples': (
+                self.num_samples.value() if hasattr(self, 'num_samples') 
+                else self.saved_settings.get('carousel_samples', self.DEFAULT_CAROUSEL_SETTINGS['carousel_samples'])
+            ),
+            'carousel_noise_duration_ms': self.duration.value(),
+            'silence_duration_ms': (
+                self.silence_duration.value() if hasattr(self, 'silence_duration') 
+                else self.saved_settings.get('silence_duration_ms', self.DEFAULT_CAROUSEL_SETTINGS['silence_duration_ms'])
+            ),
+            'export_combined': (
+                self.export_combined.isChecked() if hasattr(self, 'export_combined') 
+                else self.saved_settings.get('export_combined', self.DEFAULT_CAROUSEL_SETTINGS['export_combined'])
+            ),
+            'export_individual': (
+                self.export_individual.isChecked() if hasattr(self, 'export_individual') 
+                else self.saved_settings.get('export_individual', self.DEFAULT_CAROUSEL_SETTINGS['export_individual'])
+            ),
+            'global_normalization': (
+                self.global_norm.isChecked() if hasattr(self, 'global_norm') 
+                else self.saved_settings.get('global_normalization', self.DEFAULT_CAROUSEL_SETTINGS['global_normalization'])
+            )
+        }
+
+    def edit_template(self, is_carousel: bool):
+        """Open appropriate template editor based on mode"""
+        try:
+            if is_carousel:
+                dialog = CarouselTemplateDialog(self.carousel_template, self)
+                dialog.template_changed.connect(self.update_carousel_template)
+            else:
+                dialog = CppTemplateDialog(self.cpp_template, self)
+                dialog.template_changed.connect(self.update_cpp_template)
+            dialog.exec()
+        except Exception as e:
+            logger.error(f"Template dialog error: {e}")
+
+    def update_cpp_template(self, template: dict):
+        """Handle regular cpp template changes"""
+        logger.debug("Updating cpp template:")
+        logger.debug("Old template: %s", self.cpp_template)
+        logger.debug("New template: %s", template)
         self.cpp_template = template
-        # Also update parent's template
+        self.export_settings['cpp_template'] = template  # Update export settings
         if hasattr(self.parent(), 'cpp_template'):
-            self.parent().cpp_template = self.cpp_template.copy()
-            # Mark changes if needed
-            if hasattr(self.parent(), 'mark_unsaved_changes'):
-                self.parent().mark_unsaved_changes()
+            self.parent().cpp_template = template  # Update parent's template too
+            logger.debug("Updated parent's cpp_template: %s", self.parent().cpp_template)
+
+    def update_carousel_template(self, template: dict):
+        """Handle carousel template changes"""
+        logger.debug("Updating carousel template:")
+        logger.debug("Old template: %s", self.carousel_template)
+        logger.debug("New template: %s", template)
+        self.carousel_template = template
+        self.export_settings['carousel_template'] = template  # Update export settings
+        if hasattr(self.parent(), 'carousel_template'):
+            self.parent().carousel_template = template
+            logger.debug("Updated parent's carousel_template: %s", self.parent().carousel_template)
+
+    def apply_saved_settings(self, settings: Dict[str, Any]):
+        """Apply previously saved settings to dialog controls"""
+        try:
+            if not settings:
+                logger.debug("No settings provided to apply_saved_settings")
+                return
+
+            logger.debug("Applying saved settings: %s", settings)
+
+            # Duration
+            if 'duration' in settings:
+                logger.debug("Setting duration: %s", settings['duration'])
+                self.duration.setValue(settings['duration'] * 1000.0)  # Convert seconds back to milliseconds
+            
+            # Amplitude/Attenuation
+            if 'base_amplitude' in settings:
+                logger.debug("Setting base_amplitude: %s", settings['base_amplitude'])
+                self.amplitude.setValue(settings['base_amplitude'])
+            elif 'amplitude' in settings:
+                logger.debug("Setting amplitude: %s", settings['amplitude'])
+                self.amplitude.setValue(settings['amplitude'])
+
+            if 'enable_attenuation' in settings:
+                logger.debug("Setting enable_attenuation: %s", settings['enable_attenuation'])
+                self.enable_attenuation.setChecked(settings['enable_attenuation'])
+            if 'attenuation' in settings:
+                logger.debug("Setting attenuation: %s", settings['attenuation'])
+                self.attenuation.setValue(settings['attenuation'])
+                self.attenuation.setEnabled(settings.get('enable_attenuation', False))
+                    
+            # Process order
+            if 'fade_before_norm' in settings:
+                logger.debug("Setting fade_before_norm: %s", settings['fade_before_norm'])
+                self.process_order.setCurrentText("Fade then Normalize" if settings['fade_before_norm'] else "Normalize then Fade")
+                    
+            # Fade settings    
+            if 'fade_in_duration' in settings:
+                logger.debug("Setting fade_in_duration: %s", settings['fade_in_duration'])
+                self.fade_in.setValue(settings['fade_in_duration'] * 1000.0)
+            if 'fade_out_duration' in settings:
+                logger.debug("Setting fade_out_duration: %s", settings['fade_out_duration'])
+                self.fade_out.setValue(settings['fade_out_duration'] * 1000.0)
+            if 'fade_in_power' in settings:
+                logger.debug("Setting fade_in_power: %s", settings['fade_in_power'])
+                self.fade_in_power.setValue(settings['fade_in_power'])
+            if 'fade_out_power' in settings:
+                logger.debug("Setting fade_out_power: %s", settings['fade_out_power'])
+                self.fade_out_power.setValue(settings['fade_out_power'])
+            if 'enable_fade_in' in settings:
+                logger.debug("Setting enable_fade_in: %s", settings['enable_fade_in'])
+                self.enable_fade_in.setChecked(settings['enable_fade_in'])
+            if 'enable_fade_out' in settings:
+                logger.debug("Setting enable_fade_out: %s", settings['enable_fade_out'])
+                self.enable_fade_out.setChecked(settings['enable_fade_out'])
+            elif 'enable_fade' in settings:  # Backward compatibility
+                logger.debug("Setting enable_fade (backward compatibility): %s", settings['enable_fade'])
+                self.enable_fade_in.setChecked(settings['enable_fade'])
+                self.enable_fade_out.setChecked(settings['enable_fade'])
+                
+            # Normalization
+            if 'enable_normalization' in settings:
+                logger.debug("Setting enable_normalization: %s", settings['enable_normalization'])
+                self.enable_normalization.setChecked(settings['enable_normalization'])
+            if 'normalize_value' in settings:
+                logger.debug("Setting normalize_value: %s", settings['normalize_value'])
+                self.normalize_value.setValue(settings['normalize_value'])
+                
+            # File settings
+            if 'folder_path' in settings:
+                logger.debug("Setting folder_path: %s", settings['folder_path'])
+                self.folder_path = settings['folder_path']
+                self.folder_path_label.setText(settings['folder_path'])
+            if 'wav_filename' in settings:
+                logger.debug("Setting wav_filename: %s", settings['wav_filename'])
+                self.wav_filename.setText(settings['wav_filename'])
+            if 'cpp_filename' in settings:
+                logger.debug("Setting cpp_filename: %s", settings['cpp_filename'])
+                self.cpp_filename.setText(settings['cpp_filename'])
+
+            # Export options
+            if 'export_wav' in settings:
+                logger.debug("Setting export_wav: %s", settings['export_wav'])
+                self.export_wav.setChecked(settings['export_wav'])
+            if 'export_cpp' in settings:
+                logger.debug("Setting export_cpp: %s", settings['export_cpp'])
+                self.export_cpp.setChecked(settings['export_cpp'])
+                
+            # Seed settings
+            if 'use_random_seed' in settings:
+                logger.debug("Setting use_random_seed: %s", settings['use_random_seed'])
+                self.use_random_seed.setChecked(settings['use_random_seed'])
+            if 'seed' in settings and settings['seed'] is not None:
+                logger.debug("Setting seed: %s", settings['seed'])
+                self.seed_input.setValue(settings['seed'])
+
+            # Always apply carousel settings regardless of current tab
+            if hasattr(self, 'num_samples'):
+                logger.debug("Setting carousel_samples: %s", settings.get('carousel_samples', 20))
+                self.num_samples.setValue(settings.get('carousel_samples', 20))
+            if hasattr(self, 'silence_duration'):
+                logger.debug("Setting silence_duration_ms: %s", settings.get('silence_duration_ms', 190.0))
+                self.silence_duration.setValue(settings.get('silence_duration_ms', 190.0))
+            if hasattr(self, 'export_combined'):
+                logger.debug("Setting export_combined: %s", settings.get('export_combined', True))
+                self.export_combined.setChecked(settings.get('export_combined', True))
+            if hasattr(self, 'export_individual'):
+                logger.debug("Setting export_individual: %s", settings.get('export_individual', False))
+                self.export_individual.setChecked(settings.get('export_individual', False))
+            if hasattr(self, 'global_norm'):
+                logger.debug("Setting global_normalization: %s", settings.get('global_normalization', True))
+                self.global_norm.setChecked(settings.get('global_normalization', True))
+                self.global_norm.setEnabled(settings.get('enable_normalization', True))
+
+            # Set the tab after applying all settings
+            logger.debug("Setting tab index: %s", 0 if settings.get('carousel_enabled', False) else 1)
+            self.mode_tabs.setCurrentIndex(0 if settings.get('carousel_enabled', False) else 1)
+
+        except Exception as e:
+            logger.error("Error applying saved settings: %s", e, exc_info=True)  # Added exc_info for full traceback
+
+    def _update_normalization_controls(self, enabled: bool):
+        """Update controls that depend on normalization being enabled"""
+        self.normalize_value.setEnabled(enabled)
+        if hasattr(self, 'global_norm'):
+            self.global_norm.setEnabled(enabled)
+
+    def _update_carousel_normalization(self, state: int):
+        """Update carousel normalization option based on global normalization state"""
+        enabled = state == Qt.CheckState.Checked.value
+        if hasattr(self, 'global_norm'):
+            self.global_norm.setEnabled(enabled)
+            if not enabled:
+                self.global_norm.setChecked(False)
+
+    def _update_wav_export_options(self, state: int):
+        """Update carousel WAV export options based on global WAV export state"""
+        enabled = bool(state)  # Convert Qt.CheckState to boolean
+        if hasattr(self, 'export_combined'):
+            self.export_combined.setEnabled(enabled)
+        if hasattr(self, 'export_individual'):
+            self.export_individual.setEnabled(enabled)
 
 # In other panel classes (AnalyzerPanel, SourcePanel, FilterPanel)
 # Add change notification to parameter changes:
@@ -1708,128 +2405,65 @@ def on_parameter_changed(self):
     if hasattr(self.parent(), 'mark_unsaved_changes'):
         self.parent().mark_unsaved_changes()
 
-class HearingTestDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Extended Audiometry Data")
-        self.setModal(True)
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-
-        # Data entry grid
-        grid = QGridLayout()
-        self.data_entries = {}
-        
-        # Extended audiogram frequencies
-        frequencies = [20, 31.5, 63, 125, 250, 500, 750, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 10000, 12500, 16000]
-        
-        # Headers
-        grid.addWidget(QLabel("Frequency (Hz)"), 0, 0)
-        grid.addWidget(QLabel("Threshold (dB)"), 0, 1)
-        
-        # Create entry rows
-        for i, freq in enumerate(frequencies):
-            freq_label = QLabel(f"{freq}")
-            threshold = QSpinBox()
-            threshold.setRange(-60, 120)  # Extended range with more negative values
-            threshold.setValue(-10)  # Default to slightly better than average
-            threshold.setSuffix(" dB")
-            
-            grid.addWidget(freq_label, i+1, 0)
-            grid.addWidget(threshold, i+1, 1)
-            
-            self.data_entries[freq] = threshold
-
-        # Add scroll area for many frequencies
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        container = QWidget()
-        container.setLayout(grid)
-        scroll.setWidget(container)
-        layout.addWidget(scroll)
-
-        # Buttons
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | 
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def get_data(self) -> dict:
-        return {freq: spin.value() for freq, spin in self.data_entries.items()}
-
-    def set_data(self, data: dict):
-        for freq, value in data.items():
-            if freq in self.data_entries:
-                self.data_entries[freq].setValue(value)
-
 class OverlayTemplate:
-    def __init__(self, name: str, color: str, points: List[Tuple[float, float]]):
+    # Symbol mapping for display - shared by all overlay-related classes
+    SYMBOLS = {
+        'x': '×',  # X (filled)
+        'o': '○',  # Hollow circle
+        's': '□',  # Hollow square
+        't': '▽',  # Hollow triangle
+        '+': '+'   # Plus (filled)
+    }
+
+    def __init__(self, name: str, color: str, points: List[Tuple[float, float]], 
+                 interpolation: str = "linear", symbol: str = 'o'):
         self.name = name
         self.color = color
         self.points = points
         self.enabled = True
-        self.offset = 0  # Change to int since we're using QSpinBox
-
-class PointEditDialog(QDialog):
-    """Dialog for editing individual points"""
-    def __init__(self, freq: float = None, level: float = None, is_add: bool = False, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Add Point" if is_add else "Edit Point")
-        self.setModal(True)
-        
-        # Use last values if no values provided
-        if freq is None:
-            freq = PointEditDialog.last_freq if hasattr(PointEditDialog, 'last_freq') else 1000
-        if level is None:
-            level = PointEditDialog.last_level if hasattr(PointEditDialog, 'last_level') else 0
-            
-        self.init_ui(freq, level)
-
-    def init_ui(self, freq: float, level: float):
-        layout = QFormLayout(self)
-        
-        # Frequency input
-        self.freq_edit = QDoubleSpinBox()
-        self.freq_edit.setRange(20, 20000)
-        self.freq_edit.setValue(freq)
-        self.freq_edit.setSuffix(" Hz")
-        layout.addRow("Frequency:", self.freq_edit)
-        
-        # Level input
-        self.level_edit = QDoubleSpinBox()
-        self.level_edit.setRange(-120, 20)
-        self.level_edit.setValue(level)
-        self.level_edit.setSuffix(" dB")
-        layout.addRow("Level:", self.level_edit)
-        
-        # Buttons
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | 
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def get_values(self) -> Tuple[float, float]:
-        # Store values for next time
-        PointEditDialog.last_freq = self.freq_edit.value()
-        PointEditDialog.last_level = self.level_edit.value()
-        return (self.freq_edit.value(), self.level_edit.value())
+        self.offset = 0
+        self.interpolation = interpolation  # Add interpolation type
+        self.symbol = symbol  # Add symbol type
 
 class OverlayEditDialog(QDialog):
+    template_changed = pyqtSignal(object)  # Add signal for real-time updates
+    
     def __init__(self, parent=None, template=None):
         super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)
         self.template = template
-        self.setModal(True)
+        self.has_changes = False
         self.init_ui()
         if self.template:
             self.load_template(self.template)  # Load existing template data
+            
+        # Connect signals for real-time updates
+        self.name_edit.textChanged.connect(self.on_change)
+        self.color_combo.currentIndexChanged.connect(self.on_change)
+        self.symbol_combo.currentIndexChanged.connect(self.on_change)
+        self.interp_combo.currentIndexChanged.connect(self.on_change)
+
+    def on_change(self, *args):
+        """Handle any change in the dialog"""
+        self.has_changes = True
+        self.emit_template_change()
+
+    def reject(self):
+        """Handle dialog cancellation"""
+        if self.has_changes:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved changes. Are you sure you want to discard them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+        # Clear preview template and emit change to update display
+        if hasattr(self.parent(), 'preview_template'):
+            self.parent().preview_template = None
+            self.parent().overlay_changed.emit()
+        super().reject()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -1852,6 +2486,24 @@ class OverlayEditDialog(QDialog):
         color_layout.addWidget(QLabel("Color:"))
         color_layout.addWidget(self.color_combo)
         layout.addLayout(color_layout)
+
+        # Add symbol selector with just the symbols shown
+        symbol_layout = QHBoxLayout()
+        self.symbol_combo = QComboBox()
+        # Use symbols from OverlayTemplate
+        for code, display in OverlayTemplate.SYMBOLS.items():
+            self.symbol_combo.addItem(display, code)
+        symbol_layout.addWidget(QLabel("Symbol:"))
+        symbol_layout.addWidget(self.symbol_combo)
+        layout.addLayout(symbol_layout)
+
+        # Add interpolation selector
+        interp_layout = QHBoxLayout()
+        self.interp_combo = QComboBox()
+        self.interp_combo.addItems(['Linear', 'Cubic', 'Akima'])
+        interp_layout.addWidget(QLabel("Interpolation:"))
+        interp_layout.addWidget(self.interp_combo)
+        layout.addLayout(interp_layout)
 
         # Points editor
         points_group = QGroupBox("Points")
@@ -1877,6 +2529,7 @@ class OverlayEditDialog(QDialog):
         point_buttons.addWidget(remove_point)
         points_layout.addLayout(point_buttons)
         
+        points_group.setLayout(points_layout)
         layout.addWidget(points_group)
 
         # Different button configurations for new vs edit
@@ -1896,12 +2549,21 @@ class OverlayEditDialog(QDialog):
             ok_btn = QPushButton("Create")
             cancel_btn = QPushButton("Cancel")
             ok_btn.clicked.connect(self.accept)
+            cancel_btn.clicked.connect(self.reject)
             
             button_layout.addWidget(ok_btn)
-            
-        cancel_btn.clicked.connect(self.reject)
+            button_layout.addWidget(cancel_btn)  # Add cancel button to layout
+        
         button_layout.addWidget(cancel_btn)
         layout.addLayout(button_layout)
+
+    def emit_template_change(self):
+        """Emit signal with current template state"""
+        temp = self.get_template()
+        if self.template:  # Editing existing template
+            temp.enabled = self.template.enabled  # Preserve enabled state
+            temp.offset = self.template.offset    # Preserve offset
+        self.template_changed.emit(temp)
 
     def add_new_point(self):
         """Open edit dialog for new point"""
@@ -1926,9 +2588,76 @@ class OverlayEditDialog(QDialog):
                     item.setData(Qt.ItemDataRole.UserRole, (freq, level))
                     self.points_list.addItem(item)
                     self.sort_points()
+                    self.has_changes = True  # Mark as changed when adding point
+                    self.emit_template_change()  # Emit after adding point
                     break  # Exit loop on successful add
             else:
                 break  # User cancelled
+
+    def remove_point(self):
+        current = self.points_list.currentRow()
+        if current >= 0:
+            self.points_list.takeItem(current)
+            self.has_changes = True  # Mark as changed when removing point
+            self.emit_template_change()  # Emit after removing point
+
+    def edit_point(self, item):
+        """Edit an existing point"""
+        if not item:
+            return
+            
+        freq, level = item.data(Qt.ItemDataRole.UserRole)
+        dialog = PointEditDialog(parent=self, freq=freq, level=level)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_freq, new_level = dialog.get_values()
+            
+            # Check for duplicate frequency (excluding current point)
+            for i in range(self.points_list.count()):
+                other_item = self.points_list.item(i)
+                if other_item != item:  # Skip current item
+                    other_freq = other_item.data(Qt.ItemDataRole.UserRole)[0]
+                    if abs(other_freq - new_freq) < 0.1:
+                        QMessageBox.warning(self, "Error", 
+                            "A point at this frequency already exists!")
+                        return
+            
+            # Update point
+            item.setText(f"{new_freq} Hz, {new_level} dB")
+            item.setData(Qt.ItemDataRole.UserRole, (new_freq, new_level))
+            self.sort_points()
+            self.has_changes = True  # Mark as changed when editing point
+            self.emit_template_change()  # Emit after editing point
+
+    def get_template(self) -> OverlayTemplate:
+        return OverlayTemplate(
+            name=self.name_edit.text(),
+            color=self.color_combo.currentData(),
+            points=self.get_points(),
+            interpolation=self.interp_combo.currentText().lower(),
+            symbol=self.symbol_combo.currentData()
+        )
+
+    def load_template(self, template: OverlayTemplate):
+        self.name_edit.setText(template.name)
+        index = self.color_combo.findData(template.color)
+        if index >= 0:
+            self.color_combo.setCurrentIndex(index)
+        
+        # Set symbol
+        symbol_index = self.symbol_combo.findData(template.symbol)
+        if symbol_index >= 0:
+            self.symbol_combo.setCurrentIndex(symbol_index)
+        
+        self.points_list.clear()
+        for freq, level in template.points:
+            item = QListWidgetItem(f"{freq} Hz, {level} dB")
+            item.setData(Qt.ItemDataRole.UserRole, (freq, level))
+            self.points_list.addItem(item)
+        
+        # Set interpolation
+        index = self.interp_combo.findText(template.interpolation.title())
+        if index >= 0:
+            self.interp_combo.setCurrentIndex(index)
 
     def sort_points(self):
         """Sort points by frequency"""
@@ -1945,12 +2674,6 @@ class OverlayEditDialog(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, data)
             self.points_list.addItem(item)
 
-    def remove_point(self):
-        current = self.points_list.currentRow()
-        if current >= 0:
-            self.points_list.takeItem(current)
-            self.points = self.get_points()
-
     def get_points(self) -> List[Tuple[float, float]]:
         points = []
         for i in range(self.points_list.count()):
@@ -1958,85 +2681,16 @@ class OverlayEditDialog(QDialog):
             points.append(item.data(Qt.ItemDataRole.UserRole))
         return sorted(points, key=lambda x: x[0])  # Sort by frequency
 
-    def get_template(self) -> OverlayTemplate:
-        return OverlayTemplate(
-            name=self.name_edit.text(),
-            color=self.color_combo.currentData(),
-            points=self.get_points()
-        )
-
-    def load_template(self, template: OverlayTemplate):
-        self.name_edit.setText(template.name)
-        index = self.color_combo.findData(template.color)
-        if index >= 0:
-            self.color_combo.setCurrentIndex(index)
-        
-        self.points_list.clear()
-        for freq, level in template.points:
-            item = QListWidgetItem(f"{freq} Hz, {level} dB")
-            item.setData(Qt.ItemDataRole.UserRole, (freq, level))
-            self.points_list.addItem(item)
-
-    def edit_point(self, item):
-        """Handle editing point via dialog"""
-        if not item:
-            return
-            
-        freq, level = item.data(Qt.ItemDataRole.UserRole)
-        dialog = PointEditDialog(freq, level, False, self)
-        
-        while True:  # Keep dialog open until valid edit or cancel
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                new_freq, new_level = dialog.get_values()
-                
-                # Check for duplicate frequency
-                duplicate = False
-                for i in range(self.points_list.count()):
-                    if i != self.points_list.row(item):
-                        other_freq = self.points_list.item(i).data(Qt.ItemDataRole.UserRole)[0]
-                        if abs(other_freq - new_freq) < 0.1:
-                            QMessageBox.warning(self, "Error", 
-                                "A point at this frequency already exists!")
-                            duplicate = True
-                            break
-                
-                if not duplicate:
-                    # Update point
-                    item.setText(f"{new_freq} Hz, {new_level} dB")
-                    item.setData(Qt.ItemDataRole.UserRole, (new_freq, new_level))
-                    self.sort_points()
-                    break  # Exit loop on successful edit
-            else:
-                break
-
-    def add_point(self):
-        """Add new point via dialog"""
-        dialog = PointEditDialog(parent=self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            freq, level = dialog.get_values()
-            
-            # Check for duplicate frequency
-            for i in range(self.points_list.count()):
-                other_freq = self.points_list.item(i).data(Qt.ItemDataRole.UserRole)[0]
-                if abs(other_freq - freq) < 0.1:  # Small threshold for float comparison
-                    QMessageBox.warning(self, "Error", 
-                        "A point at this frequency already exists!")
-                    return
-            
-            # Add new point
-            item = QListWidgetItem(f"{freq} Hz, {level} dB")
-            item.setData(Qt.ItemDataRole.UserRole, (freq, level))
-            self.points_list.addItem(item)
-            self.points = self.get_points()
-
 class OverlayManager(QGroupBox):
-    overlay_changed = pyqtSignal()
+    overlay_changed = pyqtSignal()  # For real-time preview updates
+    overlay_confirmed = pyqtSignal()  # For confirmed changes that should mark profile as dirty
     
     def __init__(self, parent=None):
         super().__init__("Overlay Templates", parent)
         self.templates = []
         self.max_overlays = 5
         self.colors = ['#ff0000', '#00ff00', '#0000ff', '#ff00ff', '#00ffff']
+        self.preview_template = None  # Add storage for preview template
         self.init_ui()
 
     def init_ui(self):
@@ -2078,6 +2732,12 @@ class OverlayManager(QGroupBox):
             enable_check.toggled.connect(lambda checked, t=template: self.toggle_template(t, checked))
             item_layout.addWidget(enable_check)
             
+            # Add symbol display
+            symbol_label = QLabel(OverlayTemplate.SYMBOLS.get(template.symbol, '○'))  # Default to circle if symbol not found
+            symbol_label.setFixedWidth(20)
+            symbol_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            item_layout.addWidget(symbol_label)
+            
             # Template name
             name_label = QLabel(template.name)
             item_layout.addWidget(name_label, stretch=1)
@@ -2111,10 +2771,12 @@ class OverlayManager(QGroupBox):
     def toggle_template(self, template, enabled):
         template.enabled = enabled
         self.overlay_changed.emit()
+        self.overlay_confirmed.emit()  # This is a direct user action, so confirm it
 
     def update_offset(self, template, offset):
         template.offset = offset
         self.overlay_changed.emit()
+        self.overlay_confirmed.emit()  # This is a direct user action, so confirm it
 
     def add_template(self):
         if len(self.templates) >= self.max_overlays:
@@ -2122,29 +2784,64 @@ class OverlayManager(QGroupBox):
             return
             
         dialog = OverlayEditDialog(self)
+        # Connect template_changed signal for preview
+        dialog.template_changed.connect(self._preview_new_template)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             template = dialog.get_template()
             self.templates.append(template)
+            self.preview_template = None  # Clear preview
             self.update_list()
             self.overlay_changed.emit()
+            self.overlay_confirmed.emit()  # Template was added, confirm the change
+        else:
+            self.preview_template = None  # Clear preview on cancel
+            self.overlay_changed.emit()
+
+    def _preview_new_template(self, template: OverlayTemplate):
+        """Handle preview of new template being created"""
+        self.preview_template = template
+        self.overlay_changed.emit()
 
     def edit_template(self, index):
         """Edit an existing overlay template"""
         if 0 <= index < len(self.templates):
-            dialog = OverlayEditDialog(self, self.templates[index])  # Pass the template
+            # Store the original template for restoration on cancel
+            original_template = self.templates[index]
+            
+            # Create a copy of the template for editing
+            temp_template = OverlayTemplate(
+                name=original_template.name,
+                color=original_template.color,
+                points=original_template.points.copy(),
+                interpolation=original_template.interpolation,
+                symbol=original_template.symbol
+            )
+            temp_template.enabled = original_template.enabled
+            temp_template.offset = original_template.offset
+            
+            dialog = OverlayEditDialog(self, temp_template)
+            # Connect template_changed signal to update graph in real-time
+            dialog.template_changed.connect(lambda temp: self._handle_template_change(index, temp))
             result = dialog.exec()
+            
             if result == QDialog.DialogCode.Accepted:
                 new_template = dialog.get_template()
-                new_template.offset = self.templates[index].offset  # Preserve offset
+                new_template.offset = original_template.offset  # Preserve offset
                 self.templates[index] = new_template
-                self.update_list()
-                self.overlay_changed.emit()
+                self.overlay_confirmed.emit()  # Template was edited, confirm the change
             elif result == 2:  # Save as new
-                template = dialog.get_template()
                 if len(self.templates) < self.max_overlays:
-                    self.templates.append(template)
+                    # Create new template from dialog
+                    new_template = dialog.get_template()
+                    # Restore original template
+                    self.templates[index] = original_template
+                    # Add new template to list
+                    self.templates.append(new_template)
+                    self.overlay_confirmed.emit()  # New template was added, confirm the change
                 else:
                     QMessageBox.warning(self, "Error", "Maximum number of overlays reached")
+            else:  # Cancelled - restore original template
+                self.templates[index] = original_template
             
             self.update_list()
             self.overlay_changed.emit()
@@ -2177,27 +2874,43 @@ class OverlayManager(QGroupBox):
             self.templates.pop(index)
             self.update_list()
             self.overlay_changed.emit()
+            self.overlay_confirmed.emit()  # Template was removed, confirm the change
 
     def get_templates(self):
-        return self.templates
+        templates = self.templates.copy()
+        if self.preview_template:
+            templates.append(self.preview_template)
+        return templates
+
+    def _handle_template_change(self, index: int, template: OverlayTemplate):
+        """Handle real-time template updates during editing"""
+        if 0 <= index < len(self.templates):
+            self.templates[index] = template
+            self.overlay_changed.emit()  # Only emit changed for preview, not confirmed yet
 
 class CppTemplateDialog(QDialog):
     template_changed = pyqtSignal(dict)  # Add signal
 
     def __init__(self, template_data: dict, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)
         self.setWindowTitle("C++ Template Editor")
-        self.setModal(True)
         self.template_data = template_data
+        # Set larger default size instead of minimum
+        self.resize(400, 400)
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
 
+        # Set minimum size for better visibility
+        self.setMinimumWidth(400)
+        self.setMinimumHeight(400)
+
         # Help text
         help_text = QLabel(
             "Define the template for generating C++ code.\n"
-            "Available placeholders: {var_name}, {length_name}, {array_data}"
+            "Available placeholders: @{var_name}, @{length_name}, @{length}, @{array_data}"
         )
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
@@ -2246,33 +2959,91 @@ class CppTemplateDialog(QDialog):
             'length_name': self.length_name.text()
         }
 
-def create_menu_bar(parent: QMainWindow) -> QMenuBar:
-    menubar = QMenuBar()
-    
-    # File menu
-    file_menu = QMenu("&File", parent)
-    file_menu.addAction("&Save Settings", parent.save_settings)
-    file_menu.addAction("&Load Settings", parent.load_settings)
-    file_menu.addSeparator()
-    file_menu.addAction("Export &White Noise...", parent.export_white_noise)
+class CarouselTemplateDialog(QDialog):
+    """Dialog for editing C++ carousel template"""
+    template_changed = pyqtSignal(dict)
 
-    file_menu.addSeparator()
-    file_menu.addAction("&Exit", parent.close)
-    menubar.addMenu(file_menu)
-    
-    return menubar
-    file_menu.addSeparator()
-    file_menu.addAction("Export &White Noise...", parent.export_white_noise)
-    file_menu.addAction("&Exit", parent.close)
-    menubar.addMenu(file_menu)
-    
-    return menubar
-    file_menu.addSeparator()
-    file_menu.addAction("&Load Settings", parent.load_settings)
+    def __init__(self, template_data: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)
+        self.setWindowTitle("Carousel Template Editor")
+        self.template_data = template_data.copy()
+        
+        self.resize(500, 600)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)  # Increased spacing
+        layout.setContentsMargins(8, 10, 8, 10)  # Increased margins
+        
+        # Set minimum size for better visibility
+        self.setMinimumWidth(400)
+        self.setMinimumHeight(500)
+
+        # Help text
+        help_text = QLabel(
+            "Define the template for generating carousel C++ code.\n"
+            "Available placeholders:\n"
+            "- @{num_buffers}: Number of noise buffers\n"
+            "- @{samples_per_buffer}: Samples per noise buffer\n"
+            "- @{silence_samples}: Number of silence samples\n"
+            "- @{generator_type}: Type of noise generator used\n"
+            "- @{buffer_declarations}: Individual buffer declarations\n"
+            "- @{buffer_list}: List of buffer pointers\n"
+            "- @{buffer_array_name}: Name of buffer array\n"
+            "- @{silence_buffer_name}: Name of silence buffer\n"
+            "- @{silence_data}: Silence buffer data"
+        )
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+
+        # Template text editor
+        self.template_edit = QPlainTextEdit()
+        self.template_edit.setPlainText(self.template_data['template_text'])
+        layout.addWidget(QLabel("Template:"))
+        layout.addWidget(self.template_edit)
+
+        # Buffer naming options
+        name_group = QGroupBox("Buffer Naming")
+        name_layout = QFormLayout()
+
+        self.buffer_format = QLineEdit(self.template_data['buffer_name_format'])
+        name_layout.addRow("Buffer Name Format:", self.buffer_format)
+        
+        self.array_name = QLineEdit(self.template_data['buffer_array_name'])
+        name_layout.addRow("Buffer Array Name:", self.array_name)
+        
+        self.silence_name = QLineEdit(self.template_data['silence_buffer_name'])
+        name_layout.addRow("Silence Buffer Name:", self.silence_name)
+
+        name_group.setLayout(name_layout)
+        layout.addWidget(name_group)
+
+        # Dialog buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        """Save template changes and emit signal"""
+        template = {
+            'template_text': self.template_edit.toPlainText(),
+            'buffer_name_format': self.buffer_format.text(),
+            'buffer_array_name': self.array_name.text(),
+            'silence_buffer_name': self.silence_name.text()
+        }
+        self.template_changed.emit(template)
+        super().accept()
+
 def create_menu_bar(parent: QMainWindow) -> QMenuBar:
     menubar = QMenuBar()
     
-    # File menu
+    # File menu  
     file_menu = QMenu("&File", parent)
     file_menu.addAction("&Save Settings", parent.save_settings)
     file_menu.addAction("&Load Settings", parent.load_settings)
@@ -2283,10 +3054,325 @@ def create_menu_bar(parent: QMainWindow) -> QMenuBar:
     menubar.addMenu(file_menu)
     
     return menubar
-    file_menu.addSeparator()
-    file_menu.addAction("Export &White Noise...", parent.export_white_noise)
-    file_menu.addSeparator()
-    file_menu.addAction("&Exit", parent.close)
-    menubar.addMenu(file_menu)
+
+class CarouselSettingsDialog(QDialog):
+    """Dialog for configuring multi-noise carousel settings"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)
+        self.setWindowTitle("Carousel Settings")
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QFormLayout(self)
+        layout.setSpacing(6)  # Increased spacing
+        layout.setContentsMargins(8, 10, 8, 10)  # Increased margins
+        layout.setHorizontalSpacing(8)  # Space between labels and fields
+        layout.setVerticalSpacing(6)  # Space between rows
+        
+        # Number of samples
+        self.num_samples = QSpinBox()
+        self.num_samples.setRange(1, 100)
+        self.num_samples.setValue(20)
+        layout.addRow("Number of Samples:", self.num_samples)
+        
+        # Noise duration
+        self.noise_duration = QDoubleSpinBox()
+        self.noise_duration.setRange(1.0, 1000.0)
+        self.noise_duration.setValue(10.0)
+        self.noise_duration.setSuffix(" ms")
+        layout.addRow("Noise Duration:", self.noise_duration)
+        
+        # Silence duration
+        self.silence_duration = QDoubleSpinBox()
+        self.silence_duration.setRange(0.0, 1000.0)
+        self.silence_duration.setValue(190.0)
+        self.silence_duration.setSuffix(" ms")
+        layout.addRow("Silence Duration:", self.silence_duration)
+        
+        # Export options
+        self.export_group = QGroupBox("Export Format")
+        export_layout = QVBoxLayout()
+        
+        self.export_combined = QCheckBox("Combined Sequence")
+        self.export_individual = QCheckBox("Individual Files")
+        self.export_combined.setChecked(True)
+        
+        export_layout.addWidget(self.export_combined)
+        export_layout.addWidget(self.export_individual)
+        self.export_group.setLayout(export_layout)
+        layout.addRow(self.export_group)
+        
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def get_settings(self) -> dict:
+        return {
+            'num_samples': self.num_samples.value(),
+            'noise_duration_ms': self.noise_duration.value(),
+            'silence_duration_ms': self.silence_duration.value(),
+            'export_combined': self.export_combined.isChecked(),
+            'export_individual': self.export_individual.isChecked()
+        }
+
+class PointEditDialog(QDialog):
+    """Dialog for editing a single frequency/level point"""
+    def __init__(self, parent=None, freq=1000.0, level=0.0, is_add=False):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)
+        self.setWindowTitle("Add Point" if is_add else "Edit Point")
+        self.freq = freq
+        self.level = level
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QFormLayout(self)
+        
+        # Frequency input
+        self.freq_input = QDoubleSpinBox()
+        self.freq_input.setRange(20.0, 20000.0)
+        self.freq_input.setValue(self.freq)
+        self.freq_input.setSuffix(" Hz")
+        layout.addRow("Frequency:", self.freq_input)
+        
+        # Level input
+        self.level_input = QDoubleSpinBox()
+        self.level_input.setRange(-100.0, 100.0)
+        self.level_input.setValue(self.level)
+        self.level_input.setSuffix(" dB")
+        layout.addRow("Level:", self.level_input)
+        
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+        
+    def get_values(self) -> Tuple[float, float]:
+        return (self.freq_input.value(), self.level_input.value())
+
+class DeviceComboBox(QComboBox):
+    """Custom QComboBox for audio device selection with automatic refresh"""
     
-    return menubar
+    device_list_updated = pyqtSignal()  # Signal emitted when device list is updated
+    
+    def __init__(self, input_devices: bool = False):
+        super().__init__()
+        self._is_input = input_devices
+        self._current_devices = None
+        self._refresh_thread = None
+        self._lock = threading.Lock()
+        self._popup_visible = False
+        
+        # Create timer for periodic refresh
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(1000)  # 1 second interval
+        self._refresh_timer.timeout.connect(self._start_refresh)
+        
+        # Initial device list update
+        self._force_update_devices()
+        
+        # Connect signal to handle device list updates
+        self.device_list_updated.connect(self._apply_device_list_update)
+        
+    def showPopup(self):
+        """Override showPopup to refresh device list before showing"""
+        # Don't show popup if disabled
+        if not self.isEnabled():
+            return
+            
+        logger.debug("Dropdown about to show - starting refresh")
+        self._popup_visible = True
+        
+        # Show current list immediately
+        super().showPopup()
+        
+        # Start initial refresh
+        self._start_refresh()
+        
+        # Start periodic refresh timer
+        self._refresh_timer.start()
+    
+    def hidePopup(self):
+        """Override hidePopup to track popup state"""
+        self._popup_visible = False
+        # Stop the refresh timer
+        self._refresh_timer.stop()
+        super().hidePopup()
+    
+    def _start_refresh(self):
+        """Start a new refresh thread if one isn't already running"""
+        if self._refresh_thread is None or not self._refresh_thread.is_alive():
+            self._refresh_thread = threading.Thread(target=self._background_refresh)
+            self._refresh_thread.daemon = True
+            self._refresh_thread.start()
+    
+    def _background_refresh(self):
+        """Background thread to refresh device list"""
+        try:
+            with self._lock:
+                # Force sounddevice to rescan hardware
+                if self.isEnabled():  # Only do this when enabled (not playing)
+                    sd._terminate()
+                    sd._initialize()
+                
+                # Get current device list
+                devices = sd.query_devices()
+                device_list = []
+                
+                # Build list of available devices
+                for i in range(len(devices)):
+                    try:
+                        device = sd.query_devices(i)
+                        channels = device['max_input_channels'] if self._is_input else device['max_output_channels']
+                        if channels > 0:
+                            name = f"{device['name']} ({('In' if self._is_input else 'Out')}: {channels})"
+                            device_list.append((name, i))
+                    except Exception as e:
+                        logger.error(f"Error querying device {i}: {e}")
+                        continue
+                
+                # Only update if device list has changed
+                if self._current_devices != device_list:
+                    logger.debug("Device list changed, will update combo box")
+                    self._current_devices = device_list
+                    # Emit signal to update UI in main thread
+                    self.device_list_updated.emit()
+                    
+        except Exception as e:
+            logger.error(f"Error refreshing device list: {e}")
+    
+    def _apply_device_list_update(self):
+        """Apply device list update in the main thread"""
+        current_data = self.currentData()
+        
+        self.clear()
+        self.addItem("No Audio Device", None)
+        
+        # Add devices
+        for name, idx in self._current_devices:
+            self.addItem(name, idx)
+            
+        # Restore previous selection if it still exists
+        if current_data is not None:
+            index = self.findData(current_data)
+            if index >= 0:
+                self.setCurrentIndex(index)
+        
+        # If popup is visible, hide and show it again to force size update
+        if self._popup_visible:
+            self.hidePopup()
+            self.showPopup()
+    
+    def _force_update_devices(self):
+        """Force a synchronous device list update while preserving selection"""
+        with self._lock:
+            current_data = self.currentData()
+            
+            try:
+                # Force sounddevice to rescan hardware
+                if self.isEnabled():  # Only do this when enabled (not playing)
+                    sd._terminate()
+                    sd._initialize()
+                
+                # Get current device list
+                devices = sd.query_devices()
+                device_list = []
+                
+                # Build list of available devices
+                for i in range(len(devices)):
+                    try:
+                        device = sd.query_devices(i)
+                        channels = device['max_input_channels'] if self._is_input else device['max_output_channels']
+                        if channels > 0:
+                            name = f"{device['name']} ({('In' if self._is_input else 'Out')}: {channels})"
+                            device_list.append((name, i))
+                    except Exception as e:
+                        logger.error(f"Error querying device {i}: {e}")
+                        continue
+                
+                # Update device list
+                self._current_devices = device_list
+                self.clear()
+                self.addItem("No Audio Device", None)
+                
+                # Add devices
+                for name, idx in device_list:
+                    self.addItem(name, idx)
+                    
+                # Restore previous selection if it still exists
+                if current_data is not None:
+                    index = self.findData(current_data)
+                    if index >= 0:
+                        self.setCurrentIndex(index)
+                        
+            except Exception as e:
+                logger.error(f"Error updating device list: {e}")
+    
+    def currentDeviceInfo(self):
+        """Get current device info or None if no device selected"""
+        device_idx = self.currentData()
+        if device_idx is not None:
+            try:
+                return sd.query_devices(device_idx)
+            except Exception as e:
+                logger.error(f"Error getting device info: {e}")
+        return None
+
+    def get_device_info(self) -> Optional[dict]:
+        """Get current device info as a serializable dict"""
+        device_idx = self.currentData()
+        if device_idx is not None:
+            try:
+                device = sd.query_devices(device_idx)
+                return {
+                    'name': device['name'],
+                    'hostapi': device['hostapi'],
+                    'max_input_channels': device['max_input_channels'],
+                    'max_output_channels': device['max_output_channels']
+                }
+            except:
+                return None
+        return None
+
+    def set_device_from_info(self, device_info: Optional[dict]) -> bool:
+        """Try to find and set device matching the saved info"""
+        if not device_info:
+            self.setCurrentIndex(0)  # Set to "No Audio Device"
+            return True
+
+        # Force refresh device list
+        self._force_update_devices()
+
+        # Try to find matching device
+        devices = sd.query_devices()
+        for i in range(len(devices)):
+            try:
+                device = sd.query_devices(i)
+                if (device['name'] == device_info['name'] and
+                    device['hostapi'] == device_info['hostapi'] and
+                    device['max_input_channels'] == device_info['max_input_channels'] and
+                    device['max_output_channels'] == device_info['max_output_channels']):
+                    
+                    # Found matching device, check if it has required channels
+                    channels = device['max_input_channels'] if self._is_input else device['max_output_channels']
+                    if channels > 0:
+                        index = self.findData(i)
+                        if index >= 0:
+                            self.setCurrentIndex(index)
+                            return True
+            except:
+                continue
+
+        # No matching device found
+        self.setCurrentIndex(0)  # Set to "No Audio Device"
+        return False
