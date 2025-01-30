@@ -767,13 +767,13 @@ class SpectrumAnalyzerUI(QMainWindow):
         # Set grid properties
         plot_item.getAxis('left').setGrid(True)
         plot_item.getAxis('bottom').setGrid(True)
-        plot_item.showGrid(x=True, y=True, alpha=0.5)
+        plot_item.showGrid(x=True, y=True, alpha=0.8)
         
         # Set grid pens
         plot_item.getAxis('left').setStyle(tickTextOffset=5)
         plot_item.getAxis('bottom').setStyle(tickTextOffset=5)
-        plot_item.getAxis('left').setPen(pg.mkPen(color=grid_color, width=1, style=Qt.PenStyle.DotLine))
-        plot_item.getAxis('bottom').setPen(pg.mkPen(color=grid_color, width=1, style=Qt.PenStyle.DotLine))
+        plot_item.getAxis('left').setPen(pg.mkPen(color=grid_color, width=2, style=Qt.PenStyle.DotLine))
+        plot_item.getAxis('bottom').setPen(pg.mkPen(color=grid_color, width=2, style=Qt.PenStyle.DotLine))
         
         # Set axis labels with proper color
         self.graph_widget.setLabel('left', 'Magnitude (dB)', color=text_color)
