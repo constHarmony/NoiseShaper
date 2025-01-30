@@ -1733,6 +1733,7 @@ class CppTemplate:
 class ExportDialog(QDialog):
     def __init__(self, parent=None, mode="White Noise"):
         super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Window)
         self.setWindowTitle("Export Audio")
         self.mode = mode
         self.folder_path = None  # Initialize folder_path
