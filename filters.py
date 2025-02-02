@@ -421,7 +421,8 @@ class PlateauFilter(AudioFilter):
                  flat_width: float, amplitude: float = 1.0):
         super().__init__(config)
         self.center_freq = center_freq
-        self.width = width      # Total width (full range around Tf)
+        # Ensure width is at least 1 Hz larger than flat_width
+        self.width = max(width, flat_width + 1)
         self.flat_width = flat_width  # Width of flat section (full delta)
         # Convert amplitude to gain_db
         self.gain_db = 0.0 if amplitude == 1.0 else 20 * np.log10(amplitude)

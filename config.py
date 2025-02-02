@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VERSION = "1.1"  # Add version constant
+VERSION = "1.1.1"  # Updated version number
 
 @dataclass
 class AudioConfig:
@@ -44,7 +44,7 @@ class AudioConfig:
     
     # Monitoring settings
     monitoring_enabled: bool = False
-    monitoring_volume: float = 0.5
+    monitoring_volume: float = 0.2  # Changed from 0.5 to 0.2
     
     # Status callbacks
     on_overflow: Optional[Callable] = None

@@ -18,6 +18,7 @@ import os  # Add this import
 import threading
 import logging
 from PyQt6.QtCore import QSettings
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -212,11 +213,12 @@ class MonitoringPanel(QGroupBox):
         volume_layout = QHBoxLayout()
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(20)  # Default to 20%
+        initial_volume = int(self.config.monitoring_volume * 100)
+        self.volume_slider.setValue(initial_volume)  # Use config value
         self.volume_slider.valueChanged.connect(self.on_volume_changed)
         
         volume_label = QLabel("Volume:")
-        volume_value = QLabel("20%")  # Initial value
+        volume_value = QLabel(f"{initial_volume}%")  # Initial value
         self.volume_slider.valueChanged.connect(
             lambda v: volume_value.setText(f"{v}%"))
         
@@ -327,7 +329,11 @@ class MonitoringPanel(QGroupBox):
         if 'monitoring_enabled' in settings:
             self.monitor_checkbox.setChecked(settings['monitoring_enabled'])
         if 'monitoring_volume' in settings:
-            self.volume_slider.setValue(settings['monitoring_volume'])
+            # Convert volume to integer percentage if it's a float
+            volume = settings['monitoring_volume']
+            if isinstance(volume, float):
+                volume = int(volume * 100)
+            self.volume_slider.setValue(volume)
         if 'output_device' in settings:
             self.device_combo.set_device_from_info(settings['output_device'])
 
@@ -1733,7 +1739,7 @@ class CppTemplate:
 class ExportDialog(QDialog):
     def __init__(self, parent=None, mode="White Noise"):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.Window)
+        self.setWindowFlags(Qt.WindowType.Window)  # Add this line to make dialog movable
         self.setWindowTitle("Export Audio")
         self.mode = mode
         self.folder_path = None  # Initialize folder_path
@@ -2745,12 +2751,19 @@ class OverlayManager(QGroupBox):
             
             # Offset control with smaller width
             offset_spin = QSpinBox()
-            offset_spin.setRange(-50, 50)
+            offset_spin.setRange(-150, 150)  # Changed from ±50 to ±150
             offset_spin.setValue(template.offset)
             offset_spin.setSuffix(" dB")
             offset_spin.setFixedWidth(70)  # Make spinner more compact
             offset_spin.valueChanged.connect(lambda value, t=template: self.update_offset(t, value))
             item_layout.addWidget(offset_spin)
+
+            # Invert values button
+            invert_btn = QPushButton("±")
+            invert_btn.setFixedSize(24, 24)
+            invert_btn.setToolTip("Invert Values")
+            invert_btn.clicked.connect(lambda _, t=template: self.invert_values(t))
+            item_layout.addWidget(invert_btn)
 
             # Control buttons with symbols
             edit_btn = QPushButton("✎")
@@ -2769,6 +2782,12 @@ class OverlayManager(QGroupBox):
         
         self.template_layout.addStretch()
 
+    def invert_values(self, template):
+        """Invert all dB values in the template"""
+        template.points = [(freq, -level) for freq, level in template.points]
+        self.overlay_changed.emit()
+        self.overlay_confirmed.emit()  # This is a direct user action, so confirm it
+
     def toggle_template(self, template, enabled):
         template.enabled = enabled
         self.overlay_changed.emit()
@@ -2780,13 +2799,27 @@ class OverlayManager(QGroupBox):
         self.overlay_confirmed.emit()  # This is a direct user action, so confirm it
 
     def add_template(self):
-        if len(self.templates) >= self.max_overlays:
-            QMessageBox.warning(self, "Error", "Maximum number of overlays reached")
-            return
-            
-        dialog = OverlayEditDialog(self)
+        """Add a new overlay template"""
+        # Create default points with standard frequencies
+        default_points = [
+            (250, 0), (500, 0), (1000, 0), (2000, 0), (3000, 0),
+            (4000, 0), (6000, 0), (8000, 0), (9000, 0), (10000, 0),
+            (11200, 0), (12500, 0), (14000, 0), (16000, 0)
+        ]
+        
+        # Create template with default points
+        template = OverlayTemplate(
+            name=f"Overlay {len(self.templates) + 1}",
+            color=f"#{hash(time.time()) % 0xFFFFFF:06x}",  # Random color
+            points=default_points,
+            interpolation="linear",
+            symbol="o"
+        )
+        
+        dialog = OverlayEditDialog(self, template)
         # Connect template_changed signal for preview
         dialog.template_changed.connect(self._preview_new_template)
+        
         if dialog.exec() == QDialog.DialogCode.Accepted:
             template = dialog.get_template()
             self.templates.append(template)

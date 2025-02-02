@@ -415,6 +415,7 @@ class SpectrumAnalyzerUI(QMainWindow):
         self.config.averaging_count = fresh_config.averaging_count
         self.config.amp_whitenoise = fresh_config.amp_whitenoise
         self.config.amp_spectral = fresh_config.amp_spectral
+        self.config.monitoring_volume = fresh_config.monitoring_volume
         
         # Reset all panels to default values
         self.analyzer_panel.apply_settings({
@@ -435,6 +436,7 @@ class SpectrumAnalyzerUI(QMainWindow):
         self.source_panel.apply_settings({
             'amp_whitenoise': fresh_config.amp_whitenoise,
             'amp_spectral': fresh_config.amp_spectral,
+            'monitoring_volume': fresh_config.monitoring_volume,
             'cpp_template': None,  # This will trigger using default template in SourcePanel
             'carousel_template': None  # This will trigger using default template in SourcePanel
         })
@@ -658,6 +660,23 @@ class SpectrumAnalyzerUI(QMainWindow):
 
     def load_recent_file(self, filename):
         """Load a recent file with unsaved changes check"""
+        if not os.path.exists(filename):
+            # Ask user if they want to remove the missing file
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setText(f"The file {filename} no longer exists.")
+            msg.setInformativeText("Would you like to remove it from the recent files list?")
+            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+            
+            if msg.exec() == QMessageBox.StandardButton.Yes:
+                self.recent_files.remove(filename)
+                # Save updated list
+                settings = QSettings('YourOrg', 'SpectrumAnalyzer')
+                settings.setValue('recent_files', self.recent_files)
+                self.update_recent_menu()
+            return
+            
         if self.check_unsaved_changes():
             self.load_settings_file(filename)
 
@@ -1335,7 +1354,6 @@ class SpectrumAnalyzerUI(QMainWindow):
                         use_random_seed=settings.get('use_random_seed', True),
                         seed=settings.get('seed', None)
                     )
-                    
                     # Export WAV if enabled
                     if settings.get('export_wav', True):
                         wav_path = os.path.join(settings.get('folder_path', '.'), 
