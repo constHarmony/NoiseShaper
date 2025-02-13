@@ -19,6 +19,7 @@ import threading
 import logging
 from PyQt6.QtCore import QSettings
 import time
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -424,26 +425,6 @@ class SourcePanel(QGroupBox):
             'template_text': default_template.before + default_template.after,
             'var_name': default_template.var_name,
             'length_name': default_template.length_name
-        }
-        
-        # Initialize carousel template with default values
-        self.carousel_template = {
-            'template_text': (
-                "#define SAMPLE_RATE 44100\n"
-                "#define NUM_BUFFERS @{num_buffers}\n"
-                "#define MONO_SAMPLES @{samples_per_buffer}  // Samples per buffer\n"
-                "#define STEREO_SAMPLES (MONO_SAMPLES * 2)\n"
-                "#define SILENCE_SAMPLES @{silence_samples}\n\n"
-                "// Noise samples for carousel playback\n"
-                "// Generated with @{generator_type}\n\n"
-                "int16_t @{buffer_name}[@{samples_per_buffer}] = {@{data}};\n\n"
-                "int16_t @{silence_buffer_name}[SILENCE_SAMPLES] = {@{silence_data}};\n"
-                "int16_t* @{buffer_array_name}[NUM_BUFFERS] = {@{buffer_list}};\n"
-                "int currentBufferIndex = 0;\n"
-            ),
-            'buffer_name_format': 'buffer@{index+1}',
-            'buffer_array_name': 'noiseBuffers',
-            'silence_buffer_name': 'silenceBuffer'
         }
         
         self.init_ui()
@@ -1754,18 +1735,13 @@ class ExportDialog(QDialog):
         
         # Initialize templates with defaults if parent templates are None
         default_cpp_template = {
-            'template_text': '// Auto-generated audio data header\n\n#define SAMPLE_RATE 44100\n#define @{length_name} @{length}  // Array length\n\n// Audio samples normalized to int16 (-32768 to 32767)\nint16_t @{var_name}[@{length_name}] = {\n@{array_data}\n};\n',
+            'template_text': '// Auto-generated audio data header\n\n#define @{length_name} @{length}  // Array length\n\n// Audio samples normalized to int16 (-32768 to 32767)\nint16_t @{var_name}[@{length_name}] = {\n@{array_data}\n};\n',
             'var_name': 'audioData',
             'length_name': 'AUDIO_LENGTH'
         }
         
-        default_carousel_template = {
-            'template_text': '#define SAMPLE_RATE 44100\n#define NUM_BUFFERS @{num_buffers}\n#define MONO_SAMPLES @{samples_per_buffer}  // Samples per buffer\n#define STEREO_SAMPLES (MONO_SAMPLES * 2)\n#define SILENCE_SAMPLES @{silence_samples}\n\n// Noise samples for carousel playback\n// Generated with @{generator_type}\n\nint16_t @{buffer_name}[@{samples_per_buffer}] = {@{data}};\n\nint16_t @{silence_buffer_name}[SILENCE_SAMPLES] = {@{silence_data}};\nint16_t* @{buffer_array_name}[NUM_BUFFERS] = {@{buffer_list}};\nint currentBufferIndex = 0;\n',
-            'buffer_name_format': 'buffer@{index+1}',
-            'buffer_array_name': 'noiseBuffers',
-            'silence_buffer_name': 'silenceBuffer'
-        }
-        
+        default_carousel_template = config.SettingsManager().default_settings['source']['carousel_template']
+
         self.cpp_template = parent_cpp.copy() if parent_cpp is not None else default_cpp_template.copy()
         self.carousel_template = parent_carousel.copy() if parent_carousel is not None else default_carousel_template.copy()
         

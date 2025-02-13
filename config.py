@@ -18,7 +18,7 @@ VERSION = "1.1.1"  # Updated version number
 @dataclass
 class AudioConfig:
     # Logging settings
-    log_level: str = 'CRITICAL'  # Can be DEBUG, INFO, WARNING, ERROR, CRITICAL
+    log_level: str = 'ERROR'  # Can be DEBUG, INFO, WARNING, ERROR, CRITICAL
     
     # Audio I/O settings
     chunk_size: int = 1024     # Processing chunk size - controlled by UI
@@ -134,7 +134,25 @@ class SettingsManager:
                 'output_device_index': None,
                 'input_device_index': None,
                 'amp_whitenoise': self.config.amp_whitenoise,
-                'amp_spectral': self.config.amp_spectral
+                'amp_spectral': self.config.amp_spectral,
+                'carousel_template': {
+                    'template_text': (
+                        "#define SAMPLE_RATE 44100\n"
+                        "#define NUM_BUFFERS @{num_buffers}\n"
+                        "#define MONO_SAMPLES @{samples_per_buffer}  // Samples per buffer\n"
+                        "#define STEREO_SAMPLES (MONO_SAMPLES * 2)\n"
+                        "#define SILENCE_SAMPLES @{silence_samples * 2}\n\n"
+                        "// Noise samples for carousel playback\n"
+                        "// Generated with @{generator_type}\n\n"
+                        "int16_t @{buffer_name}[@{samples_per_buffer}] = {@{data}};\n\n"
+                        "int16_t @{silence_buffer_name}[SILENCE_SAMPLES] = {@{silence_data}};\n"
+                        "int16_t* @{buffer_array_name}[NUM_BUFFERS] = {@{buffer_list}};\n"
+                        "int currentBufferIndex = 0;\n"
+                    ),
+                    'buffer_name_format': 'buffer@{index+1}',
+                    'buffer_array_name': 'noiseBuffers',
+                    'silence_buffer_name': 'silenceBuffer'
+                }
             },
             'audio': {
                 'chunk_size': self.config.chunk_size,
