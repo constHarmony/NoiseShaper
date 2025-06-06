@@ -39,6 +39,7 @@ class SpectrumAnalyzerUI(QMainWindow):
         self.recent_files = []
         self.max_recent_files = 5
         self.export_settings = {}  # Store last used export settings
+        self._playback_change_in_progress = False  # Add this flag
         
         # Set minimum window size that works for all modes
         self.setMinimumWidth(800)
@@ -617,7 +618,6 @@ class SpectrumAnalyzerUI(QMainWindow):
                 'filters': self._numpy_to_list(self.filter_panel.get_current_settings()),
                 'overlays': self._numpy_to_list(overlay_settings),
                 'export': self._numpy_to_list(self.export_settings),
-                'cpp_template': self._numpy_to_list(self.source_panel.cpp_template),
                 'spectral_components': [widget.get_parameters() for widget in self.parabola_panel.parabolas]
             }
             
@@ -707,8 +707,18 @@ class SpectrumAnalyzerUI(QMainWindow):
         return True
 
     def mark_unsaved_changes(self):
+        if self._playback_change_in_progress:
+            return
         self.has_unsaved_changes = True
         self.update_window_title()
+
+    def start_playback_change(self):
+        """Signal that playback state change is starting."""
+        self._playback_change_in_progress = True
+
+    def end_playback_change(self):
+        """Signal that playback state change has finished."""
+        self._playback_change_in_progress = False
 
     def show_error(self, title: str, message: str):
         """Shows an error dialog"""

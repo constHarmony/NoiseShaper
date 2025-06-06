@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
 from typing import Dict, Any, List, Tuple, Optional  # Add these imports
 import sounddevice as sd
-from config import AudioConfig
+from config import AudioConfig, SettingsManager
 from audio_sources import MonitoredInputSource
 from PyQt6.QtGui import QDoubleValidator
 import numpy as np
@@ -427,6 +427,9 @@ class SourcePanel(QGroupBox):
             'length_name': default_template.length_name
         }
         
+        # Initialize carousel_template
+        self.carousel_template = SettingsManager().default_settings['source']['carousel_template']
+        
         self.init_ui()
 
     def init_ui(self):
@@ -782,6 +785,13 @@ class SourcePanel(QGroupBox):
 
     def toggle_playback(self):
         """Toggle playback state"""
+        main_window = self.window()
+        if not hasattr(main_window, 'start_playback_change'):
+            # Fallback or log error if main window is not as expected
+            logger.error("Could not find main window to manage dirty state.")
+            return
+            
+        main_window.start_playback_change()
         try:
             if self.is_playing:
                 logger.debug("Stopping playback")
@@ -821,8 +831,8 @@ class SourcePanel(QGroupBox):
                     device_idx = output_device_idx  # For noise sources, use output device
                 
                 # Update config before creating new source
-                self.config.device_input_index = input_device_idx
-                self.config.device_output_index = output_device_idx
+                self.config.device_input = input_device_idx
+                self.config.device_output = output_device_idx
                 self.config.input_device_enabled = (input_device_idx is not None)
                 self.config.output_device_enabled = (output_device_idx is not None)
                 self.config.monitoring_enabled = self.monitoring_panel.monitor_checkbox.isChecked()
@@ -863,6 +873,8 @@ class SourcePanel(QGroupBox):
             # Re-enable device selection on error
             self.monitoring_panel.device_combo.setEnabled(True)
             self.input_device_panel.device_combo.setEnabled(True)
+        finally:
+            main_window.end_playback_change()
 
     def handle_source_reference(self, source):
         """Store reference to current source"""

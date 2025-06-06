@@ -296,17 +296,20 @@ class MonitoredInputSource(AudioSource):
     def _output_callback(self, outdata: np.ndarray, frames: int,
                          time_info: dict, status: sd.CallbackFlags) -> None:
         """Output callback reading from ring buffer"""
-        if status.output_underflow:
-            if hasattr(self.config, 'on_underflow') and self.config.on_underflow:
-                self.config.on_underflow()
+        logger.debug(f"MonitoredInputSource._output_callback: called with frames={frames}, status='{status}', time_info={time_info}")
         if status:
-            logger.debug(f'Output callback status: {status}')
+            if status.output_underflow:
+                logger.warning("MonitoredInputSource._output_callback: Output underflow detected!")
+            if status.output_overflow:
+                logger.warning("MonitoredInputSource._output_callback: Output overflow detected!")
 
         if not self._running or not self.config.monitoring_enabled:
+            # logger.debug(f"MonitoredInputSource._output_callback: Not running or monitoring disabled. Filling outdata with zeros.")
             outdata.fill(0)
             return
 
         try:
+            # logger.debug(f"MonitoredInputSource._output_callback: Reading {frames * self.config.channels} samples from ring buffer.")
             # Read from ring buffer
             data, new_pos = self._read_from_ring_buffer(
                 frames * self.config.channels, 
@@ -314,14 +317,18 @@ class MonitoredInputSource(AudioSource):
             )
             self._monitor_pos = new_pos
             
+            if np.all(data == 0):
+                logger.warning("MonitoredInputSource._output_callback: Read only zeros from ring buffer. Potential underflow.")
+
+            # logger.debug(f"MonitoredInputSource._output_callback: Read {len(data)} samples. Reshaping and applying volume.")
             # Apply volume and reshape
             outdata[:] = np.multiply(
                 data.reshape(-1, self.config.channels), 
                 self.config.monitoring_volume
             )
+            # logger.debug(f"MonitoredInputSource._output_callback: Filled outdata with {len(outdata)} samples. Max abs value: {np.max(np.abs(outdata)) if outdata.size > 0 else 0}")
         except Exception as e:
-            logger.error(f"Output callback error: {e}")
-            traceback.print_exc()
+            logger.error(f"Output callback error: {e}\n{traceback.format_exc()}")
             outdata.fill(0)
 
     def _handle_queue_data(self, data: np.ndarray, queue_obj: queue.Queue):
@@ -346,7 +353,7 @@ class MonitoredInputSource(AudioSource):
             try:
                 # Input stream setup with higher latency for stability
                 self.input_stream = sd.InputStream(
-                    device=self.config.device_input_index,
+                    device=self.config.device_input,
                     channels=self.config.channels,
                     samplerate=self.config.sample_rate,
                     blocksize=self._input_buffer_size,
@@ -357,9 +364,9 @@ class MonitoredInputSource(AudioSource):
                 self.input_stream.start()
 
                 # Output stream setup - match input settings
-                if self.config.monitoring_enabled and self.config.device_output_index is not None:
+                if self.config.monitoring_enabled and self.config.device_output is not None:
                     self.output_stream = sd.OutputStream(
-                        device=self.config.device_output_index,
+                        device=self.config.device_output,
                         channels=self.config.channels,
                         samplerate=self.config.sample_rate,
                         blocksize=self._output_buffer_size,  # Use matching size
@@ -383,9 +390,9 @@ class MonitoredInputSource(AudioSource):
                 self.output_stream.close()
                 self.output_stream = None
             
-            if self.config.device_output_index is not None:
+            if self.config.device_output is not None:
                 self.output_stream = sd.OutputStream(
-                    device=self.config.device_output_index,
+                    device=self.config.device_output,
                     channels=self.config.channels,
                     samplerate=self.config.sample_rate,
                     blocksize=512,  # Use smaller blocksize
@@ -397,12 +404,12 @@ class MonitoredInputSource(AudioSource):
 
     def update_monitoring(self):
         """Update monitoring state"""
-        if self.config.monitoring_enabled and self.config.device_output_index is not None:
+        if self.config.monitoring_enabled and self.config.device_output is not None:
             # Start output stream if it doesn't exist
             if self.output_stream is None:
                 try:
                     self.output_stream = sd.OutputStream(
-                        device=self.config.device_output_index,
+                        device=self.config.device_output,
                         channels=self.config.channels,
                         samplerate=self.config.sample_rate,
                         blocksize=512,
@@ -513,7 +520,7 @@ class NoiseGenerator:
             # Currently only apply filters in white noise mode
             # TODO: Future feature - add flag to enable filter application in spectral mode
             if self.filters:
-                logger.debug(f"NoiseGenerator generate - applying {len(self.filters)} filters")
+                # logger.debug(f"NoiseGenerator generate - applying {len(self.filters)} filters")
                 # Apply filter in frequency domain if any
                 spectrum = np.fft.fft(data)
                 for filter_ in self.filters:
@@ -1151,20 +1158,27 @@ class NoiseSource(AudioSource):
 
     def _generate_chunk(self, frames: int) -> np.ndarray:
         """Generate noise chunk with proper buffering"""
+        # logger.debug(f"NoiseSource._generate_chunk: called with frames={frames}")
         if frames <= 0:
+            logger.warning(f"NoiseSource._generate_chunk: requested frames is {frames}, returning empty array.")
             return np.array([], dtype=np.float32)
             
         if self.noise_type == 'spectral':
+            # logger.debug(f"NoiseSource._generate_chunk (spectral): current _synthesis_buffer len={len(self._synthesis_buffer)}")
             # Fill synthesis buffer until we have enough frames
             while len(self._synthesis_buffer) < frames:
                 # Always generate using spectral_size for consistency
+                # logger.debug(f"NoiseSource._generate_chunk (spectral): _synthesis_buffer needs more data (has {len(self._synthesis_buffer)}, needs {frames}). Generating {self.config.spectral_size} samples.")
                 data = self.generator.generate(self.config.spectral_size, self.config.sample_rate, noise_type='spectral')
+                # logger.debug(f"NoiseSource._generate_chunk (spectral): generator.generate returned {len(data)} samples.")
                 if data.size > 0:
                     # Apply amplitude scaling based on mode
                     amplitude = self.config.amp_spectral if self.noise_type == 'spectral' else self.config.amp_whitenoise
                     data = data * amplitude
                     self._synthesis_buffer = np.concatenate((self._synthesis_buffer, data))
+                    # logger.debug(f"NoiseSource._generate_chunk (spectral): _synthesis_buffer len after append: {len(self._synthesis_buffer)}")
                 else:
+                    logger.warning("NoiseSource._generate_chunk (spectral): generator.generate returned 0 samples. Breaking fill loop.")
                     break
                     
             if len(self._synthesis_buffer) >= frames:
@@ -1173,16 +1187,21 @@ class NoiseSource(AudioSource):
                 # Update buffer
                 self._synthesis_buffer = self._synthesis_buffer[frames:]
                 self._last_chunk = output_data
+                # logger.debug(f"NoiseSource._generate_chunk (spectral): returning {len(output_data)} samples. _synthesis_buffer remaining: {len(self._synthesis_buffer)}")
                 return output_data
             else:
+                logger.warning(f"NoiseSource._generate_chunk (spectral): not enough data in _synthesis_buffer (has {len(self._synthesis_buffer)}, needs {frames}). Returning zeros.")
                 return np.zeros(frames, dtype=np.float32)
         else:
             # White noise can be generated at exact frame size
+            # logger.debug(f"NoiseSource._generate_chunk (whitenoise): generating {frames} samples.")
             data = self.generator.generate(frames, self.config.sample_rate, noise_type=self.noise_type)  # Use self.noise_type
+            # logger.debug(f"NoiseSource._generate_chunk (whitenoise): generator.generate returned {len(data)} samples.")
             # Apply amplitude scaling based on mode
             amplitude = self.config.amp_spectral if self.noise_type == 'spectral' else self.config.amp_whitenoise
             data = data * amplitude
             self._last_chunk = data
+            # logger.debug(f"NoiseSource._generate_chunk (whitenoise): returning {len(data)} samples.")
             return data
 
     def read(self) -> np.ndarray:
@@ -1204,24 +1223,43 @@ class NoiseSource(AudioSource):
     def _audio_callback(self, outdata: np.ndarray, frames: int,
                        time_info: dict, status: sd.CallbackFlags) -> None:
         """Audio output callback - only active if device is enabled"""
+        logger.debug(f"NoiseSource._audio_callback: called with frames={frames}, status={status}, time_info={time_info}")
+        if status:
+            if status.output_underflow:
+                logger.warning("NoiseSource._audio_callback: Output underflow detected!")
+            if status.output_overflow:
+                logger.warning("NoiseSource._audio_callback: Output overflow detected!")
+            if status.input_underflow: # Though less likely for an output callback, log if present
+                logger.warning("NoiseSource._audio_callback: Input underflow detected on output stream status!")
+            if status.input_overflow: # Though less likely for an output callback, log if present
+                logger.warning("NoiseSource._audio_callback: Input overflow detected on output stream status!")
+            if status.priming_output: # Log if output is being primed
+                 logger.info("NoiseSource._audio_callback: Output stream is priming.")
+
+
         if not self._running:
+            # logger.debug("NoiseSource._audio_callback: not running, filling outdata with zeros.")
             outdata.fill(0)
             return
 
         try:
             # Generate fresh chunk for audio
+            # logger.debug(f"NoiseSource._audio_callback: calling _generate_chunk for {frames} frames.")
             audio_data = self._generate_chunk(frames)
+            # logger.debug(f"NoiseSource._audio_callback: _generate_chunk returned {len(audio_data)} frames.")
             self._last_chunk = audio_data  # Store for visualization
             
             if self.config.monitoring_enabled:
                 # Clip the audio data to prevent overflow
                 scaled_data = audio_data.reshape(-1, self.config.channels) * self.config.monitoring_volume
                 np.clip(scaled_data, -1.0, 1.0, out=outdata)
+                # logger.debug(f"NoiseSource._audio_callback: monitoring enabled, filled outdata with {len(outdata)} samples. Max abs value: {np.max(np.abs(outdata)) if outdata.size > 0 else 0}")
             else:
+                # logger.debug("NoiseSource._audio_callback: monitoring disabled, filling outdata with zeros.")
                 outdata.fill(0)
 
         except Exception as e:
-            logger.error(f"Audio callback error: {e}")
+            logger.error(f"Audio callback error: {e}\n{traceback.format_exc()}")
             outdata.fill(0)
             if self.config.on_underflow:
                 self.config.on_underflow()
@@ -1231,7 +1269,7 @@ class NoiseSource(AudioSource):
             self._running = True
             self._audio_buffer = np.array([], dtype=np.float32)
             
-            if (self.config.device_output_index is not None and 
+            if (self.config.device_output is not None and 
                 self.config.output_device_enabled):
                 try:
                     # Pre-fill buffer with validation
@@ -1245,7 +1283,7 @@ class NoiseSource(AudioSource):
                     logger.debug(f"Using blocksize: {safe_blocksize}")
                     
                     self.stream = sd.OutputStream(
-                        device=self.config.device_output_index,
+                        device=self.config.device_output,
                         channels=self.config.channels,
                         samplerate=self.config.sample_rate,
                         blocksize=safe_blocksize,
@@ -1269,9 +1307,9 @@ class NoiseSource(AudioSource):
                 self.stream.close()
                 self.stream = None
             
-            if self.config.device_output_index is not None:
+            if self.config.device_output is not None:
                 self.stream = sd.OutputStream(
-                    device=self.config.device_output_index,
+                    device=self.config.device_output,
                     channels=self.config.channels,
                     samplerate=self.config.sample_rate,
                     blocksize=self.config.output_buffer_size,  # Fix: use output_buffer_size

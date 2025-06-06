@@ -1,6 +1,6 @@
 # config.py
 from dataclasses import dataclass, asdict
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, Union
 import json
 import os
 from pathlib import Path
@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VERSION = "1.1.1"  # Updated version number
+VERSION = "1.1.3"  # Updated version number
 
 @dataclass
 class AudioConfig:
@@ -41,6 +41,10 @@ class AudioConfig:
     # Device enabled flags
     input_device_enabled: bool = False
     output_device_enabled: bool = False
+    
+    # Device selection (index or string name)
+    device_input: Optional[Union[int, str]] = None
+    device_output: Optional[Union[int, str]] = None
     
     # Monitoring settings
     monitoring_enabled: bool = False
@@ -131,8 +135,8 @@ class SettingsManager:
                 'source_type': 'White Noise',
                 'monitoring_enabled': self.config.monitoring_enabled,
                 'monitoring_volume': int(self.config.monitoring_volume * 100),
-                'output_device_index': None,
-                'input_device_index': None,
+                'output_device': None,
+                'input_device': None,
                 'amp_whitenoise': self.config.amp_whitenoise,
                 'amp_spectral': self.config.amp_spectral,
                 'carousel_template': {
@@ -199,12 +203,12 @@ class SettingsManager:
         return result
 
     def _remove_device_indices(self, settings: Dict[str, Any]) -> Dict[str, Any]:
-        """Create copy of settings without device indices"""
+        """Create copy of settings without device indices/names"""
         settings = settings.copy()
         if 'source' in settings:
             settings['source'] = settings['source'].copy()
-            settings['source']['input_device_index'] = None
-            settings['source']['output_device_index'] = None
+            settings['source']['input_device'] = None
+            settings['source']['output_device'] = None
         return settings
 
     def apply_to_config(self, settings: Dict[str, Any]):
